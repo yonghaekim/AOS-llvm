@@ -1,0 +1,118 @@
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/AOS/AOS.h"
+#include <iostream>
+
+using namespace llvm;
+using namespace AOS;
+
+#define DEBUG_TYPE "AOS_opt_dpi_pass"
+
+STATISTIC(StatLoadDataPointer, "Number of loads using data pointers");
+STATISTIC(StatStoreDataPointer, "Number of stores using data pointers");
+
+namespace {
+  class AOSOptDpiPass : public FunctionPass {
+
+  public:
+    static char ID; // Pass identification, replacement for typeid
+
+    AOSOptDpiPass() : FunctionPass(ID) {}
+    bool runOnFunction(Function &F) override;
+
+  private:
+    inline bool handleInstruction(Function &F, Instruction &I);
+    bool handleStoreInstruction(Function &F, StoreInst *pSI);
+    bool handleLoadInstruction(Function &F, LoadInst *pLI);
+  };
+}
+
+char AOSOptDpiPass::ID = 0;
+static RegisterPass<AOSOptDpiPass> X("aos-dpi", "AOS opt dip pass");
+
+Pass *llvm::AOS::createAOSOptDpiPass() { return new AOSOptDpiPass(); }
+
+bool AOSOptDpiPass::runOnFunction(Function &F) {
+  bool function_modified = false;
+
+  for (auto &BB:F)
+    for (auto &I: BB) {
+      function_modified = handleInstruction(F, I) || function_modified;
+    }
+
+  return function_modified;
+}
+
+inline bool AOSOptDpiPass::handleInstruction(Function &F, Instruction &I) {
+  bool modified = false;
+  switch(I.getOpcode()) {
+    default:
+      break;
+    case Instruction::Store:
+      modified = handleStoreInstruction(F, dyn_cast<StoreInst>(&I));
+      break;
+    case Instruction::Load:
+      modified = handleLoadInstruction(F, dyn_cast<LoadInst>(&I));
+      break;
+  }
+
+  return modified;
+}
+
+static inline bool isDataPointer(const Type *const type) {
+  return type->isPointerTy() && !type->getPointerElementType()->isFunctionTy();
+}
+
+bool AOSOptDpiPass::handleStoreInstruction(Function &F, StoreInst *pSI) {
+  const auto V = pSI->getValueOperand();
+  const auto VType = V->getType();
+
+  if (! isDataPointer(VType))
+    return false;
+
+  //pSI->dump();
+
+  Value *calledValue = pSI->getValueOperand();
+
+  const auto calledValueType = calledValue->getType();
+
+  IRBuilder<> Builder(pSI->getNextNode());
+  auto memory = Intrinsic::getDeclaration(F.getParent(), Intrinsic::aos_memory, {calledValueType});
+
+  Builder.CreateCall(memory, {calledValue}, "");
+
+  StatStoreDataPointer++;
+
+  return true;
+}
+
+bool AOSOptDpiPass::handleLoadInstruction(Function &F, LoadInst *pLI) {
+  const auto VType = pLI->getPointerOperandType()->getPointerElementType();
+
+  if (! isDataPointer(VType))
+    return false;
+
+  //pLI->dump();
+
+  Value *calledValue = pLI;
+  const auto calledValueType = pLI->getType();
+
+  IRBuilder<> Builder(pLI->getNextNode());
+  auto memory = Intrinsic::getDeclaration(F.getParent(), Intrinsic::aos_memory, {calledValueType});
+
+  Builder.CreateCall(memory, {calledValue}, "");
+
+  StatLoadDataPointer++;
+
+  return true;
+}
+

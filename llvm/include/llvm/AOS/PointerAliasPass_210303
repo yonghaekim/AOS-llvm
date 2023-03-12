@@ -1,0 +1,75 @@
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/ADT/SCCIterator.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/AOS/AOS.h"
+#include <iostream>
+
+using namespace llvm;
+using namespace AOS;
+
+//#define DEBUG_TYPE "aos_mark_taint_pass"
+
+//namespace {
+  class AOSPointerAliasPass : public ModulePass {
+
+  public:
+    static char ID; // Pass identification, replacement for typeid
+    AOSPointerAliasPass() : ModulePass(ID) {}
+
+		class AliasPair {
+		public:
+			Value *alias;
+			std::list<Value*> index_list;
+
+			AliasPair (Value *_alias, std::list<Value*> _index_list) {
+				alias = _alias;
+				index_list = _index_list;
+			}
+		};
+
+		class PtrAlias {
+		public:
+			Value *pointer;
+      int start_idx;
+			std::list<AliasPair> alias_pairs;
+
+      PtrAlias (Value *_pointer, std::list<Value*> _index_list) {
+        pointer = _pointer;
+        AliasPair pair(_pointer, _index_list);
+        alias_pairs.push_back(pair);
+      }
+		};
+
+    std::list<Function*> func_list;
+		std::list<PtrAlias> alias_map;
+  	std::set<Value*> visit_set;
+
+    bool runOnModule(Module &M) override;
+		void getAnalysisUsage(AnalysisUsage &AU) const;
+    std::list<AOSPointerAliasPass::PtrAlias> getAliasMap();
+
+  private:  
+		//void getFunctionsFromCallGraph(Module &M);
+		void handleGlobalVariables(Module &M);
+		void getFunctionsFromCallGraph(Module &M);
+		void handleInstructions(BasicBlock *BB);
+		//void handleCmdLineArguments(Module &M);
+		PtrAlias getPointerAliases(PtrAlias ptr_alias, Value *pV, std::list<Value*> index_list);
+    bool find_pointer(Value *V);
+    bool find_alias(Value *V);
+    bool index_compare(std::list<Value*> idx_list_a, std::list<Value*> idx_list_b, int start_idx);
+    int get_start_idx(Type *Ty);
+  };
+//}
+

@@ -1,0 +1,572 @@
+#include "llvm/AOS/AOSMarkTaintPass.h"
+
+char AOSMarkTaintPass::ID = 0;
+static RegisterPass<AOSMarkTaintPass> X("aos-mark", "AOS mark taint pass");
+
+Pass *llvm::AOS::createAOSMarkTaintPass() { return new AOSMarkTaintPass(); }
+
+bool AOSMarkTaintPass::runOnModule(Module &M) {
+  AOSPointerAliasPass &MT = getAnalysis<AOSPointerAliasPass>();
+	root_node = MT.getRootNode();
+  value_map = MT.getValueMap();
+
+  handleGlobalVariables(M);
+
+  handleInstructions(M);
+
+	//list<AOSNode *> node_list;
+  //set<AOSNode *> visit_set;
+
+  ////errs() << "Hi I am in MarkTaintPass!\n";
+	//for (auto it = root_node->children.begin(); it != root_node->children.end(); it++) {
+  //  if (visit_set.find(*it) == visit_set.end()) {
+  //    visit_set.insert(*it);
+  //		node_list.push_back(*it);
+  //  }
+	//}
+
+	//while (!node_list.empty()) {
+	//	AOSNode *node = node_list.front();
+	//	node_list.pop_front();
+
+  //  //errs() << "Print AOSNode!\n";
+  //  for (auto it = node->aliases.begin(); it != node->aliases.end(); it++) {
+  //    bool needTaint = false;
+
+  //    needTaint = findExInputFunc(it->first);
+  //  }
+
+	//	for (auto it = node->children.begin(); it != node->children.end(); it++) {
+  //    if (visit_set.find(*it) == visit_set.end()) {
+  //      visit_set.insert(*it);
+  //      node_list.push_back(*it);
+  //    }
+	//	}
+	//}
+
+	//for (auto it = root_nodes.begin(); it != alias_map.root_nodes.end(); it++) {
+	//	list<AOSNode *> node_list;
+	//	node_list.push_back(*it);
+
+	//	while (!node_list.empty()) {
+	//		AOSNode *node = node_list.front();
+	//		node_list.pop_front();
+
+	//		//errs() << "Print AOSNode!\n";
+	//		for (auto itb = node->aliases.begin(); itb != node->aliases.end(); itb++) {
+  //      bool needTaint = false;
+
+	//	    needTaint = findExInputFunc((*itb)->ptr);
+	//		}
+
+	//		for (auto itb = node->adj_nodes.begin(); itb != node->adj_nodes.end(); itb++) {
+	//			node_list.push_back(*itb);
+	//		}
+	//	}
+	//}
+
+	//for (auto it = alias_map.begin(); it != alias_map.end(); it++) {
+	//	bool needTaint;
+
+	//	//errs() << "Detect Ex Input Func for this pointer!\n--";
+	//	//it->pointer->dump();
+
+	//	//needTaint = findExInputFunc(it->alias_pairs);
+
+	//	//if (needTaint) {
+	//	//	// field sensitive...?
+	//	//	doTaintPropagation(it->alias_pairs);
+	//	//}
+	//}
+
+	//// Handle command line arguments
+	//handleCmdLineArguments(M);
+
+	//errs() << "Print ExInputSet!\n";
+	for (auto it = ex_input_set.begin(); it != ex_input_set.end(); it++)
+		(*it)->dump();
+
+  return false;
+}
+
+void AOSMarkTaintPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+  AU.addRequired<AOSPointerAliasPass>();
+}
+
+void AOSMarkTaintPass::handleGlobalVariables(Module &M) {
+	for (auto &G : M.getGlobalList()) {
+		GlobalVariable *pGV = dyn_cast<GlobalVariable>(&G);
+    Type *ty = pGV->getType()->getElementType();
+
+		// Skip constant GV
+		if (pGV->isConstant())
+			continue;
+
+    checkAndPropTaint(pGV, ty, true);
+  }
+}
+
+void AOSMarkTaintPass::handleInstructions(Module &M) {
+  for (auto &F : M) {
+    for (auto &BB : F) {
+      for (auto &I : BB) {
+        switch(I.getOpcode()) {
+          case Instruction::Alloca:
+          {
+            AllocaInst *pAI = dyn_cast<AllocaInst>(&I);
+            Type *ty = pAI->getAllocatedType();
+
+            checkAndPropTaint(pAI, ty, true);
+
+            break;
+          }
+          case Instruction::Invoke:
+          case Instruction::Call:
+          {
+            Function *pF;
+
+            if (CallInst *pCI = dyn_cast<CallInst>(&I))
+              pF = pCI->getCalledFunction();
+            else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I))
+              pF = pII->getCalledFunction();
+
+            if (pF && (pF->getName() == "malloc" ||
+                        pF->getName() == "calloc" ||
+                        pF->getName() == "realloc" ||
+                        pF->getName() == "_Znwm" /* new */ ||
+                        pF->getName() == "_Znam" /* new[] */)) {
+
+              checkAndPropTaint(&I, nullptr, false); // TODO
+            }
+
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+	}
+}
+
+void AOSMarkTaintPass::checkAndPropTaint(Value *pV, Type *ty, bool type_chk) {
+  if (type_chk && !ty->isArrayTy() && !ty->isStructTy()) {
+    errs() << "--- Skip for this value! ---\n";
+    pV->dump();
+    return;
+  }
+
+  errs() << "--- Skip for this value! ---\n";
+  pV->dump();
+
+  list<AOSNode *> node_list;
+  set<AOSNode *> visit_set;
+  bool needTaint = false;
+  AOSNode *node = value_map[pV];
+
+  assert(node != nullptr);
+
+  node_list.push_back(node);
+
+  while (!node_list.empty()) {
+    node = node_list.front();
+    node_list.pop_front();
+
+    //errs() << "Print AOSNode!\n";
+    for (auto it = node->aliases.begin(); it != node->aliases.end(); it++) {
+      needTaint = findExInputFunc(it->first);
+    }
+
+    if (needTaint) {
+      errs() << "*** Found variable to taint! ***\n";
+      pV->dump();
+    }
+
+    for (auto it = node->children.begin(); it != node->children.end(); it++) {
+      if (visit_set.find(*it) == visit_set.end()) {
+        visit_set.insert(*it);
+        node_list.push_back(*it);
+      }
+    }
+  }
+}
+
+
+//std::set<Value*> AOSMarkTaintPass::getTaintedValues() {
+//	return taint_set;
+//}
+//
+//std::set<Value*> AOSMarkTaintPass::getSignedValues() {
+//	return sign_set;
+//}
+
+//void AOSMarkTaintPass::handleCmdLineArguments(Module &M) {
+//	for (auto &F : M) {
+//		if (F.getName() == "main") {
+//			//errs() << "Found main function\n";
+//
+//			//TODO sign **argv
+//
+//			unsigned arg_nth = 0;
+//
+//			for (auto arg = F.arg_begin(); arg != F.arg_end(); arg++) {
+//				if (arg_nth == 0) {
+//					std::set<Value *> user_set;
+//					user_set = getDepUsers(user_set, dyn_cast<Value>(arg));
+//
+//					//errs() << "Mark taint!\n";
+//					for (auto it = user_set.begin(); it != user_set.end(); it++) {
+//						//(*it)->dump();
+//						taint_set.insert(dyn_cast<Value>(*it));
+//						//(*it)->setTainted(true);
+//					}
+//
+//					visit_set.clear();
+//				} else if (arg_nth == 1) {
+//					std::set<Value *> argv_set;
+//
+//					argv_set = getPointerAliases(argv_set, dyn_cast<Value>(arg));
+//
+//				//errs() << "Print argv aliases\n";
+//				//for (auto it = argv_set.begin(); it != argv_set.end(); it++) {
+//				//	(*it)->dump();
+//				//}
+//					for (auto it = argv_set.begin(); it != argv_set.end(); it++) {
+//						for (auto U : (*it)->users()) {
+//							//errs() << "(*it)->users(): ";
+//							//U->dump();
+//
+//							if (Instruction *pUI = dyn_cast<Instruction>(U)) {
+//								if (pUI->getOpcode() == Instruction::Load) {
+//									std::set<Value *> alias_set;
+//									auto pLI = dyn_cast<LoadInst>(pUI);
+//								
+//									alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pLI));
+//
+//									assert(pLI->getPointerOperand() == dyn_cast<Value>((*it)));
+//
+//									doTaintPropagation(alias_set);
+//									visit_set.clear();
+//								}
+//							}
+//						}
+//					}
+//				}
+//
+//				arg_nth++;
+//			}
+//
+//			break;
+//		}
+//	}
+//}
+
+
+bool AOSMarkTaintPass::findExInputFunc(Value *pV) {
+	// iterate PtrAlias
+	//for (auto it = alias_pairs.begin(); it != alias_pairs.end(); it++) {
+    // How to handle taint propagation for this?
+
+    //CallInst *CI = dyn_cast<CallInst>(it->alias);
+    //InvokeInst *II = dyn_cast<InvokeInst>(it->alias);
+
+    //if (CI || II) {
+    //  Function *pF;
+    //  if (CI)
+    //    pF = CI->getCalledFunction();
+    //  else
+    //    pF = II->getCalledFunction();
+
+    //  if (pF && (pF->getName() == "fgetc" ||
+    //                    pF->getName() == "fgetc_unlocked" ||
+    //                    pF->getName() == "getc" ||
+    //                    pF->getName() == "getc_unlocked" ||
+    //                    pF->getName() == "_IO_getc" ||
+    //                    pF->getName() == "getchar" ||
+    //                    pF->getName() == "getchar_unlocked" ||
+    //                    pF->getName() == "fgetwc" ||
+    //                    pF->getName() == "fgetwc_unlocked" ||
+    //                    pF->getName() == "getwc" ||
+    //                    pF->getName() == "getwc_unlocked" ||
+    //                    pF->getName() == "getwchar" ||
+    //                    pF->getName() == "getwchar_unlocked")) {
+    //    //errs() << "Found " << pF->getName() << ": ";
+    //    //pCI->dump();
+    //    ex_input_set.insert(dyn_cast<Value>(it->alias));
+    //  }
+    //}
+
+		for (auto U : pV->users()) {
+			//errs() << "In findExInputFunc\n";
+			//pV->dump();
+
+			if (CallInst *pCI = dyn_cast<CallInst>(U)) {
+				Function *pF = pCI->getCalledFunction();
+
+				//errs() << "  @@pF->name(): " << pF->getName() << "\n";
+				if (pF && (pF->getName() == "__isoc99_scanf" ||
+										pF->getName() == "scanf" ||
+										pF->getName() == "wscanf")) {
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+
+					// Except arg 0
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+            //TODO !!! find among alias_??
+						if (t != 0 && dyn_cast<Value>(arg) == pV) {
+    					ex_input_set.insert(dyn_cast<Value>(U));
+              break;
+							//return true;
+            }
+
+						t++;
+					}		
+				} else if (pF && (pF->getName() == "fscanf" ||
+													pF->getName() == "__isoc99_fscanf" ||
+													pF->getName() == "wscanf")) {
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					// Except arg 0 & 1
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+						if (t != 0 && t != 1 && dyn_cast<Value>(arg) == pV) {
+    					ex_input_set.insert(dyn_cast<Value>(U));
+              break;
+							//return true;
+            }
+
+						t++;
+					}
+				} else if (pF && (pF->getName() == "fread" ||
+													pF->getName() == "fread_unlocked" ||
+													pF->getName() == "fgets" ||
+													pF->getName() == "fgets_unlocked" ||
+													pF->getName() == "gets" ||
+													pF->getName() == "gets_unlocked" ||
+													pF->getName() == "read" ||
+													pF->getName() == "getline")) {
+
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					// Arg 0
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+						if (t == 0 && dyn_cast<Value>(arg) == pV) {
+    					ex_input_set.insert(dyn_cast<Value>(U));
+              break;
+							//return true;
+            }
+
+						t++;
+					}
+				} else if (pF && pF->getName() == "_ZNSi7getlineEPcl") {
+          // std::iostream&.getline()
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					// Arg 1
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+						if (t == 1 && dyn_cast<Value>(arg) == pV) {
+    					ex_input_set.insert(dyn_cast<Value>(U));
+              break;
+            }
+
+						t++;
+					}
+				}
+			} else if (InvokeInst *pII = dyn_cast<InvokeInst>(U)) {
+				Function *pF = pII->getCalledFunction();
+
+				if (pF && pF->getName() == "_ZNSi7getlineEPcl") {
+          // std::iostream&.getline()
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					// Arg 1
+					int t = 0;
+					for (auto arg = pII->arg_begin(); arg != pII->arg_end(); ++arg) {
+						if (t == 1 && dyn_cast<Value>(arg) == pV) {
+    					ex_input_set.insert(dyn_cast<Value>(U));
+              break;
+            }
+
+						t++;
+					}
+        }
+      }
+		}
+	//}
+
+	return false;
+}
+
+//void AOSMarkTaintPass::doTaintPropagation(std::set<Value *> alias_set) {
+//	//errs() << "--Start taint propagation\n";
+//
+//	std::set<Value *> user_set;
+//	visit_set.clear();
+//
+//	for (auto it = alias_set.begin(); it != alias_set.end(); it++) {
+//		//errs() << "----I am an alias ";
+//		//(*it)->dump();
+//		taint_set.insert(dyn_cast<Value>(*it));
+//
+//		// Handle string functions?
+//		// + sscanf
+//		//
+//		if (std::find(user_set.begin(), user_set.end(), dyn_cast<Value>(*it))
+//									== user_set.end()) {
+//
+//			user_set.insert(dyn_cast<Value>(*it));
+//
+//			for (auto U : (*it)->users()) {
+//				//errs() << "------I am a user ";
+//				//U->dump();
+//
+//				if (auto pUI = dyn_cast<Instruction>(U)) {
+//					if (pUI->getOpcode() == Instruction::Load) {
+//
+//						//visit_set.clear();
+//						user_set = getDepUsers(user_set, dyn_cast<Value>(pUI));
+//					}
+//				}
+//			}
+//		}
+//	}
+//
+//	for (auto itb = user_set.begin(); itb != user_set.end(); itb++) {
+//		//(*itb)->dump();
+//		taint_set.insert(dyn_cast<Value>(*itb));
+//		//(*itb)->setTainted(true);
+//	}
+//
+//	user_set.clear();
+//	visit_set.clear();
+//}
+//
+//std::set<Value*> AOSMarkTaintPass::getDepUsers(std::set<Value *> user_set, Value *pV) {
+//	// Check if already handled
+//	if (std::find(visit_set.begin(), visit_set.end(), pV)
+//								!= visit_set.end())
+//		return user_set;
+//
+//	visit_set.insert(pV);
+//
+//	for (auto U: pV->users()) {
+//		//errs() << "--------I am a user of a user ";
+//		//U->dump();
+//
+//		if (auto pUI = dyn_cast<Instruction>(U)) {
+//			switch (pUI->getOpcode()) {
+//				case Instruction::Call:
+//				{
+//					//errs() << "Handle Call Inst!\n";
+//
+//					CallInst *pCI = dyn_cast<CallInst>(pUI);
+//					Function *pF = pCI->getCalledFunction();
+//
+//					//TODO can intrinsic func return pointer alias?
+//					if (pF && !pF->isVarArg() && !pF->isDeclaration()) {
+//						unsigned arg_nth = 0;
+//
+//						for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+//							if (dyn_cast<Value>(arg) == pV)
+//								break;
+//
+//							arg_nth++;
+//						}
+//
+//						assert(arg_nth < pCI->arg_size());
+//						assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+//
+//						//errs() << "arg_nth: " << arg_nth << "\n";
+//
+//						unsigned t = 0;
+//						for (auto arg = pF->arg_begin(); arg != pF->arg_end(); arg++) {
+//							if (t++ == arg_nth) {
+//								//arg->dump();
+//
+//								std::set<Value *> arg_user_set;
+//								arg_user_set = getDepUsers(arg_user_set, arg);
+//
+//								for (auto it = arg_user_set.begin(); it != arg_user_set.end(); it++)
+//									user_set.insert(*it);
+//
+//								//return value...? can iterate over user list from func?
+//								for (auto &BB : *pF) {
+//									for (auto &I : BB) {
+//										if (ReturnInst *pRI = dyn_cast<ReturnInst>(&I)) {
+//											//errs() << "Found return inst!\n";
+//											if(std::find(arg_user_set.begin(), arg_user_set.end(),
+//													pRI->getReturnValue()) != arg_user_set.end()) {
+//												//errs() << "Continue with return\n";
+//												user_set = getDepUsers(user_set, dyn_cast<Value>(pCI));
+//											}
+//
+//											break;
+//										}
+//									}
+//								}
+//
+//								arg_user_set.clear();
+//
+//								break;
+//							}
+//						}
+//					} else {
+//						//TODO need to insert intrinsic function????
+//						//visit_set.insert(pV);
+//						user_set.insert(dyn_cast<Value>(pUI));
+//						user_set = getDepUsers(user_set, dyn_cast<Value>(pUI));
+//					}
+//
+//					break;
+//				}
+//				case Instruction::Store:
+//				{
+//					//visit_set.insert(pV);
+//
+//					auto pSI = dyn_cast<StoreInst>(pUI);
+//
+//					if (pSI->getValueOperand() == pV) {
+//						//errs() << "Handle Store Inst!\n";
+//
+//						auto op = pSI->getPointerOperand();
+//
+//						for (auto U2: op->users()) {
+//							if (auto pUI2 = dyn_cast<Instruction>(U2)) {
+//								if (pUI2->getOpcode() == Instruction::Load) {
+//									auto pLI = dyn_cast<LoadInst>(pUI2);
+//
+//									if (std::find(user_set.begin(), user_set.end(), dyn_cast<Value>(pLI))
+//																== user_set.end())
+//										user_set.insert(dyn_cast<Value>(pLI));
+//
+//									user_set = getDepUsers(user_set, dyn_cast<Value>(pLI));
+//									
+//									assert(pLI->getPointerOperand() == dyn_cast<Value>(op));
+//								}
+//							}
+//						}
+//					}
+//
+//					break;
+//				}
+//				case Instruction::Load:
+//					//visit_set.insert(pV);
+//					break;
+//				default:
+//				{
+//					//visit_set.insert(pV);
+//					user_set.insert(dyn_cast<Value>(pUI));
+//					user_set = getDepUsers(user_set, dyn_cast<Value>(pUI));
+//					break;
+//				}
+//			}
+//		}
+//	}
+//
+//	return user_set;
+//}
+

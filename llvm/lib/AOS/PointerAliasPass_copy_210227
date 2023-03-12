@@ -1,0 +1,505 @@
+#include "llvm/AOS/AOSPointerAliasPass.h"
+
+char AOSPointerAliasPass::ID = 0;
+static RegisterPass<AOSPointerAliasPass> X("aos-alias", "AOS pointer alias pass");
+
+Pass *llvm::AOS::createAOSPointerAliasPass() { return new AOSPointerAliasPass(); }
+
+bool AOSPointerAliasPass::runOnModule(Module &M) {
+	// Handle global variables
+	handleGlobalVariables(M);
+
+	// Handle AllocaInst and CallInst (malloc)
+	handleInstructions(M);
+
+	for (auto it = alias_map.begin(); it != alias_map.end(); it++) {
+		errs() << "Print pointer!\n--";
+		it->pointer->dump();
+		for (auto itb = it->alias_pairs.begin(); itb != it->alias_pairs.end(); itb++) {
+			errs() << "  Print alias!\n  ----";
+			itb->alias->dump();
+			//itb->index_list->dump();
+			errs() << "    Print index!\n";
+			int cnt = 0;
+			for (auto itc = itb->index_list.begin(); itc != itb->index_list.end(); itc++) {
+				errs() << "    ----[" << cnt << "]";
+				(*itc)->dump();;
+				cnt++;
+			}
+			errs() << "\n";
+		}
+	}
+
+  return false;
+}
+
+void AOSPointerAliasPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+}
+
+std::list<AOSPointerAliasPass::PtrAlias> AOSPointerAliasPass::getAliasMap() {
+	return alias_map;
+}
+
+void AOSPointerAliasPass::handleGlobalVariables(Module &M) {
+	for (auto &G : M.getGlobalList()) {
+		GlobalVariable *pGV = dyn_cast<GlobalVariable>(&G);
+
+		std::list<Value*> index_list;
+		PtrAlias ptr_alias(pGV, index_list);
+
+		if (find_pointer(pGV))
+			continue;
+
+		ptr_alias.start_idx = get_start_idx(pGV->getType()->getElementType());
+
+		//ptr_alias.pointer = dyn_cast<Value>(pGV);
+		//AliasPair pair(pGV, index_list);
+		//ptr_alias.alias_pairs.push_back(pair);
+		ptr_alias = getPointerAliases(ptr_alias, pGV, index_list);
+		alias_map.push_back(ptr_alias);
+
+		//errs() << "Found GlobalVariable!\n";
+		//pGA->dump();
+
+		visit_set.clear();
+	}
+}
+
+void AOSPointerAliasPass::handleInstructions(Module &M) {
+	for (auto &F : M) {
+		for (auto &BB : F) {
+			for (auto &I : BB) {
+				std::list<Value*> index_list;
+				PtrAlias ptr_alias(dyn_cast<Value>(&I), index_list);
+
+				if (find_pointer(&I)) //TODO really need this?
+					continue;
+
+				if (AllocaInst *pAI = dyn_cast<AllocaInst>(&I)) {
+					ptr_alias.start_idx = get_start_idx(pAI->getAllocatedType());
+					//errs() << "Found AllocaInst!\n";
+					//pAI->dump();
+					//ptr_alias.pointer = dyn_cast<Value>(pAI);
+					//AliasPair pair(pAI, index_list);
+					//ptr_alias.alias_pairs.push_back(pair);
+					ptr_alias = getPointerAliases(ptr_alias, pAI, index_list);
+					alias_map.push_back(ptr_alias);
+				} else if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+					Type *Ty = pCI->getType();
+					for (auto U : pCI->users()) {
+						if (BitCastInst *pBC = dyn_cast<BitCastInst>(U)) {
+							Ty = pBC->getDestTy();
+							break;
+						}
+					}
+
+					ptr_alias.start_idx = get_start_idx(Ty);
+
+					Function *pF = pCI->getCalledFunction();
+
+					//errs() << "pF->name: " << pF->getName();
+					//for (auto fU : pF->users()) {
+					//	errs() << "user of function..?\n";
+					//	fU->dump();
+					//}
+
+					if (pF && (pF->getName() == "malloc" ||
+											pF->getName() == "calloc" ||
+											pF->getName() == "realloc")) {
+						//errs() << "Found " << pF->getName() << "\n";
+						//pCI->dump();
+
+						//ptr_alias.pointer = dyn_cast<Value>(pCI);
+						//AliasPair pair(pCI, index_list);
+						//ptr_alias.alias_pairs.push_back(pair);
+						ptr_alias = getPointerAliases(ptr_alias, pCI, index_list);
+						alias_map.push_back(ptr_alias);
+					}
+				}
+
+				visit_set.clear();
+			}
+		}
+	}
+}
+
+AOSPointerAliasPass::PtrAlias AOSPointerAliasPass::getPointerAliases(PtrAlias ptr_alias, Value *pV, std::list<Value*> index_list) {
+	//@spec_fd, {{@buf, {i64 0, i64 %idxprom22, i32 3}}, {%len, {i64 0, i64 %idxprom22, i32 1}}}
+
+	// Check if already visited
+	if (std::find(visit_set.begin(), visit_set.end(), pV)
+								!= visit_set.end())
+		return ptr_alias;
+
+	visit_set.insert(pV);
+
+	for (auto U: pV->users()) {
+		//ptr_alias.pointer->dump();
+		//errs() << "--pV->users(): ";
+		//U->dump();
+
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			switch (pUI->getOpcode()) {
+				case Instruction::Call:
+			  {
+					//errs() << "Handle Call Inst!\n";
+					//pUI->dump();
+					CallInst *pCI = dyn_cast<CallInst>(pUI);
+					Function *pF = pCI->getCalledFunction();
+
+					//TODO can intrinsic func return pointer alias?
+					if (pF && !pF->isVarArg() && !pF->isDeclaration()) {
+						unsigned arg_nth = 0;
+
+						for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+							if (dyn_cast<Value>(arg) == pV)
+								break;
+
+							arg_nth++;
+						}
+
+						assert(arg_nth < pCI->arg_size());
+						assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+						unsigned t = 0;
+						for (auto arg = pF->arg_begin(); arg != pF->arg_end(); arg++) {
+							if (t++ == arg_nth) {
+								//arg->dump();
+								//errs() << "arg_nth: " << arg_nth << "\n";
+								//errs() << "t: " << t << "\n";
+
+								AliasPair pair(arg, index_list);
+								ptr_alias.alias_pairs.push_back(pair);
+								ptr_alias = getPointerAliases(ptr_alias, arg, index_list);
+
+								//PtrAlias arg_alias(arg, index_list);
+								//arg_alias = getPointerAliases(arg_alias, arg, index_list);
+
+								//for (auto it = arg_alias.alias_pairs.begin(); it != arg_alias.alias_pairs.end(); it++) {
+								//	ptr_alias.alias_pairs.push_back(*it);
+								//}
+
+								////for (auto it = arg_alias.begin(); it != arg_alias.end(); it++)
+								////	alias_set.insert(*it);
+
+								////return value...? can iterate over user list from func?
+								//for (auto &BB : *pF) {
+								//	for (auto &I : BB) {
+								//		if (ReturnInst *pRI = dyn_cast<ReturnInst>(&I)) {
+								//			for (auto it = arg_alias.alias_pairs.begin(); it != arg_alias.alias_pairs.end(); it++) {
+								//				if (it->alias == pRI->getReturnValue()) {
+								//					//errs() << "Found return inst!\n";
+								//					ptr_alias = getPointerAliases(ptr_alias, pCI, it->index_list);
+								//				}
+								//			}
+
+								//			break;
+								//		}
+								//	}
+								//}
+
+								break;
+							}
+						}
+					}
+
+					break;
+				}
+				case Instruction::Store:
+				{
+					auto pSI = dyn_cast<StoreInst>(pUI);
+
+					if (pSI->getValueOperand() == pV) {
+						errs() << "Handle Store Inst!\n";
+						pSI->dump();
+
+						auto op = pSI->getPointerOperand();
+
+						//op->dump();
+						//op->getOpcode()->dump();
+						//op->getType()->dump();
+
+						// Search alias map and check whether source element is already in map
+						// If so, get start_offset (which is the first position of field index)
+						// by checking the type of source element
+						// Iterate over uesrs of op, and if a user is GEPOp or GEPInst,
+						// compare the indices starting from the start_offset.
+						// If same, 
+						// After the start_offset, compare the indices.
+						// If same, 
+
+						//if (auto Inst = dyn_cast<Instruction>(op)) {
+						//	for (auto opU: op->users()) {
+						//		if (auto pLI = dyn_cast<LoadInst>(opU)) {
+						//	//errs() << "Found Load Inst!\n";
+						//	//pLI->dump();
+						//			AliasPair pair(pLI, index_list);
+						//			ptr_alias.alias_pairs.push_back(pair);
+						//			ptr_alias = getPointerAliases(ptr_alias, pLI, index_list);
+						//			
+						//			assert(pLI->getPointerOperand() == dyn_cast<Value>(op));
+						//		}
+						//	}
+						////} else if (BitCastOperator *BCOp = dyn_cast<BitCastOperator>(op)) {
+						////	errs() << "Found BitCastOperator!\n"; // TODO handle BitCast
+						////	BCOp->getOperand(0)->dump();
+						////	BCOp->getSrcTy()->dump();
+
+						//} else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(op)) {
+						//} else {
+							//errs() << "Found GEP!\n";
+							//GEPOp->dump();
+
+							if (!find_alias(GEPOp)) {
+								errs() << "Couldn't find alias!\n";
+								assert(false);
+							}
+
+							bool chk = false;
+							int start_idx;
+							std::list<Value*> index_list_op;
+
+							for (auto it = alias_map.begin(); it != alias_map.end(); it++) {
+								for (auto itb = it->alias_pairs.begin(); itb != it->alias_pairs.end(); itb++) {
+									if (itb->alias == dyn_cast<Value>(GEPOp)) {
+										start_idx = it->start_idx;
+										index_list_op = itb->index_list;
+										chk = true;
+										break;
+									}
+								}
+
+								if (chk) {
+									//
+									for (auto itb = it->alias_pairs.begin(); itb != it->alias_pairs.end(); itb++) {
+										if (index_compare(index_list_op, itb->index_list, start_idx)) {
+											for (auto opU: itb->alias->users()) {
+												if (auto pLI = dyn_cast<LoadInst>(opU)) {
+													//errs() << "Found GEP->Load Inst!\n";
+													//pLI->dump();
+													AliasPair pair(pLI, index_list);
+													ptr_alias.alias_pairs.push_back(pair);
+													ptr_alias = getPointerAliases(ptr_alias, pLI, index_list_op);
+													//assert(pLI->getPointerOperand() == dyn_cast<Value>(op));
+												}
+											}
+										}
+									}
+
+									break;
+								}
+							//}
+	
+							//std::list<Value*> index_list_op;
+
+							//// TODO care index_list only for StructTy...
+
+							//for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+							//	if (it != GEPOp->idx_begin())
+							//		index_list_op.push_back(*it);
+							//}
+
+							////errs() << "GEPOp: \n";
+							////GEPOp->dump();
+							//Value *src_ptr = GEPOp->getPointerOperand();
+
+							//if (!find_pointer(src_ptr)) {
+							//	errs() << "Couldn't find pointer!\n";
+							//	assert(false);
+							//	//GEPOp->dump();
+							//	//src_ptr->dump();
+
+							//	assert(ptr_alias.pointer != src_ptr);
+
+							//	std::list<Value*> index_list_new;
+							//	PtrAlias ptr_alias_new(src_ptr, index_list_new);
+
+							//	//ptr_alias_new.pointer = src_ptr;
+							//	ptr_alias_new = getPointerAliases(ptr_alias_new, src_ptr, index_list_new);
+							//	alias_map.push_back(ptr_alias_new);
+							//}
+
+							//for (auto it = alias_map.begin(); it != alias_map.end(); it++) {
+							//	//errs() << "Print pointer!\n--";
+							//	if (it->pointer == src_ptr) {
+							//		//errs() << "Found src_ptr!\n";
+							//		//src_ptr->dump();
+
+							//		// start offset
+							//		int start_idx = 0;
+							//		auto type = GEPOp->getSourceElementType();
+							//		//type->dump();
+							//		while (type->isArrayTy()) {
+							//			type = type->getArrayElementType();
+							//			start_idx++;
+							//		}
+
+							//		//errs() << "start_idx: " << start_idx << "\n";
+
+							//		for (auto itb = it->alias_pairs.begin(); itb != it->alias_pairs.end(); itb++) {
+							//			if (index_compare(index_list_op, itb->index_list, start_idx)) {
+							//				for (auto opU: itb->alias->users()) {
+							//					if (auto pLI = dyn_cast<LoadInst>(opU)) {
+							//						//errs() << "Found GEP->Load Inst!\n";
+							//						//pLI->dump();
+							//						AliasPair pair(pLI, index_list);
+							//						ptr_alias.alias_pairs.push_back(pair);
+							//						ptr_alias = getPointerAliases(ptr_alias, pLI, index_list_op);
+							//						//assert(pLI->getPointerOperand() == dyn_cast<Value>(op));
+							//					}
+							//				}
+							//			}
+							//		}
+
+							//		break;
+							//	}
+							//}
+						}
+					}
+
+					break;
+				}
+				case Instruction::GetElementPtr:
+				{
+					std::list<Value*> index_list_new = index_list;
+					auto pGEPI = dyn_cast<GetElementPtrInst>(pUI);
+
+					for (auto it = pGEPI->idx_begin(); it != pGEPI->idx_end(); it++) {
+						if (it != pGEPI->idx_begin()) {
+							index_list_new.push_back(*it);
+						}
+					}
+
+					AliasPair pair(pUI, index_list_new);
+					ptr_alias.alias_pairs.push_back(pair);
+					ptr_alias = getPointerAliases(ptr_alias, pUI, index_list_new);
+
+					break;
+				}
+				case Instruction::Ret:
+				{
+					ReturnInst *pRI = dyn_cast<ReturnInst>(pUI);
+					Function *pF = pRI->getFunction();
+
+					if (pV == pRI->getReturnValue()) {
+						for (auto Ub : pF->users()) {
+							if (CallInst *pCI = dyn_cast<CallInst>(Ub)) {
+								AliasPair pair(pCI, index_list);
+								ptr_alias.alias_pairs.push_back(pair);
+								ptr_alias = getPointerAliases(ptr_alias, pCI, index_list);
+							}
+						}
+
+						errs() << "Found Return!\n";
+					}
+					break;
+				}
+				case Instruction::Select:
+				case Instruction::PHI:
+				case Instruction::BitCast:
+				case Instruction::PtrToInt:
+				case Instruction::IntToPtr:
+				case Instruction::Add:
+				case Instruction::Sub:
+				case Instruction::Shl:
+				//case Instruction::Lshr:
+				//case Instruction::Ashr:
+				case Instruction::And:
+				case Instruction::Or:
+				case Instruction::Xor:
+				{
+					//errs() << "Handle Inst!\n";
+					AliasPair pair(pUI, index_list);
+					ptr_alias.alias_pairs.push_back(pair);
+					ptr_alias = getPointerAliases(ptr_alias, pUI, index_list);
+
+					break;
+				}
+				default:
+					break;
+			}
+		} else if (BitCastOperator *BCOp = dyn_cast<BitCastOperator>(U)) {
+			std::list<Value*> index_list_new = index_list;
+
+			if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(BCOp->getOperand(0))) {
+				for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+					if (it != GEPOp->idx_begin()) {
+						index_list_new.push_back(*it);
+					}
+				}
+			}
+
+			AliasPair pair(U, index_list_new);
+			ptr_alias.alias_pairs.push_back(pair);
+		} else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(U)) {
+			//errs() << "I am GEP Op!\n";
+			//U->dump();
+
+			std::list<Value*> index_list_new = index_list;
+
+			for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+				if (it != GEPOp->idx_begin()) {
+					index_list_new.push_back(*it);
+				}
+			}
+
+			AliasPair pair(U, index_list_new);
+			ptr_alias.alias_pairs.push_back(pair);
+			//ptr_alias = getPointerAliases(ptr_alias, pUI, index_list_new);
+		//} else if (BitCastOperator *BCOp = dyn_cast<BitCastOperator>(U)) {
+		//	errs() << "Found BitCastOperator!\n";
+		//	BCOp->getSrcTy()->dump();
+		}
+
+	}
+
+	return ptr_alias;
+}
+
+bool AOSPointerAliasPass::find_pointer(Value *V) {
+	for (auto it = alias_map.begin(); it != alias_map.end(); it++)
+		if (it->pointer == V)
+			return true;
+
+	return false;
+}
+
+bool AOSPointerAliasPass::find_alias(Value *V) {
+	for (auto it = alias_map.begin(); it != alias_map.end(); it++)
+		for (auto itb = it->alias_pairs.begin(); itb != it->alias_pairs.end(); itb++)
+			if (itb->alias == V)
+				return true;
+
+	return false;
+}
+
+bool AOSPointerAliasPass::index_compare(std::list<Value*> idx_list_a, std::list<Value*> idx_list_b, int start_idx) {
+	auto itr_a = idx_list_a.begin();
+	auto itr_b = idx_list_b.begin();
+	//errs() << "size: " << size << "\n";
+
+	if (idx_list_a.size() != idx_list_b.size())
+		return false;
+
+	for (int i=0; i<idx_list_a.size(); i++, itr_a++, itr_b++) {
+		if (i < start_idx)
+			continue;
+
+		if (*itr_a != *itr_b)
+			return false;
+	}
+
+	return true;
+}
+
+int AOSPointerAliasPass::get_start_idx(Type *Ty) {
+	int start_idx = 0;
+
+	while (Ty->isArrayTy()) {
+		Ty = Ty->getArrayElementType();
+		start_idx++;
+	}
+
+	return start_idx;
+}

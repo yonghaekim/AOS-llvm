@@ -1,0 +1,176 @@
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/ADT/SCCIterator.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/AOS/AOS.h"
+#include <iostream>
+
+using namespace llvm;
+using namespace AOS;
+using namespace std;
+
+//#define DEBUG_TYPE "aos_mark_taint_pass"
+
+//namespace {
+  class AOSPointerAliasPass : public ModulePass {
+
+  public:
+    static char ID; // Pass identification, replacement for typeid
+    AOSPointerAliasPass() : ModulePass(ID) {}
+
+		class AOSAlias;
+		class AOSNode;
+
+    class AOSAlias {
+    public:
+      Value *ptr;
+      AOSNode *node;
+
+      AOSAlias () { }
+
+      AOSAlias (Value *_ptr, AOSNode *_node) {
+        ptr = _ptr;
+				node = _node;
+      }
+
+      Value *getPtr() { return ptr; }
+
+      AOSNode *getNode() { return node; }
+
+      void setNode(AOSNode *_node) { node = _node; }
+    };
+
+    class AOSNode {
+    public:
+			Type *ty;
+			unsigned start_idx;
+			list<Value *> indices;
+			map<Value *, AOSAlias *> aliases;
+
+			bool isMemNode;
+			bool merged;
+
+			set<AOSNode *> successors;
+			set<AOSNode *> predecessors;
+
+			set<AOSNode *> store_edge;
+			set<AOSNode *> load_edge;
+
+      AOSNode () {
+				start_idx = 0;
+				isMemNode = false;
+				merged = false;
+			}
+
+			void setType(Type *_ty) {
+				ty = _ty;
+				start_idx = 0;
+
+				while (_ty->isArrayTy()) {
+					_ty = _ty->getArrayElementType();
+					start_idx++;
+				}
+			}
+
+			void addSucc(AOSNode *succ) {
+				successors.insert(succ);
+			}
+
+			void addPred(AOSNode *succ) {
+				predecessors.insert(succ);
+			}
+
+			void removeSucc(AOSNode *succ) {
+				successors.erase(succ);
+			}
+
+			void removePred(AOSNode *succ) {
+				predecessors.erase(succ);
+			}
+
+			bool findAlias(Value *ptr) {
+				return (aliases[ptr] == NULL) ? false : true;
+			}
+
+			void addAlias(AOSAlias *alias) {
+					aliases[alias->getPtr()] = alias;
+			}
+
+			void addStoreEdge(AOSNode *node) {
+				store_edge.insert(node);
+			}
+
+			void addLoadEdge(AOSNode *node) {
+				load_edge.insert(node);
+			}
+
+			AOSNode* findIndice(list<Value *> new_indices) {
+				for (auto it = successors.begin(); it != successors.end(); it++) {
+					auto itr_a = (*it)->indices.begin();
+					auto itr_b = new_indices.begin();
+					//errs() << "size: " << size << "\n";
+
+					unsigned i;
+					unsigned size = (*it)->indices.size();
+
+					if (size != new_indices.size())
+						continue;
+
+					if (size < start_idx + 1)
+						return (*it);
+
+					for (i=0; i<size; i++, itr_a++, itr_b++) {
+						if (i < start_idx)
+							continue;
+
+						if ((*itr_a) != (*itr_b))
+							break;
+					}
+
+					if (i == size)
+						return (*it);
+				}
+
+				return nullptr;
+			}
+		};
+
+    list<AOSAlias *> work_list;
+		list<Function *> uncalled_funcs;
+		list<Function *> func_list;
+		map<Value *, AOSNode *> value_map;
+		AOSNode *root_node;
+		set<AOSNode *> mem_nodes;
+
+    bool runOnModule(Module &M) override;
+		void getAnalysisUsage(AnalysisUsage &AU) const;
+    AOSPointerAliasPass::AOSNode* getRootNode();
+
+  private:  
+		//void getFunctionsFromCallGraph(Module &M);
+		void handleGlobalVariables(Module &M);
+		void getFunctionsFromCallGraph(Module &M);
+		void handleInstructions(BasicBlock *BB);
+		//void handleCmdLineArguments(Module &M);
+		void getPointerAliases(AOSAlias *alias);
+		void resolveMemoryEdge();
+		void mergeNode(AOSNode *dst, AOSNode *src);
+		void handleStoreEdge(AOSNode *node);
+    Value *getArgument(Value *pI, Value *pV);
+    bool index_compare(std::list<Value*> idx_list_a, std::list<Value*> idx_list_b, int start_idx);
+    int get_start_idx(Type *Ty);
+		void dump();
+		void printAliases(AOSNode *node);
+  };
+//}
+

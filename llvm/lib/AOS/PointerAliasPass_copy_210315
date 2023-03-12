@@ -1,0 +1,686 @@
+#include "llvm/AOS/AOSPointerAliasPass.h"
+
+char AOSPointerAliasPass::ID = 0;
+
+static RegisterPass<AOSPointerAliasPass> X("aos-alias", "AOS pointer alias pass");
+
+Pass *llvm::AOS::createAOSPointerAliasPass() { return new AOSPointerAliasPass(); }
+
+bool AOSPointerAliasPass::runOnModule(Module &M) {
+	getFunctionsFromCallGraph(M);
+
+	root_node = new AOSNode();
+
+	// Handle global variables
+	handleGlobalVariables(M);
+
+	//handleCommandLineArguments();
+
+	for (auto it = func_list.begin(); it != func_list.end(); it++) {
+		Function *pF = *it;
+
+		// TODO it means uncalled func
+		if (pF && !pF->isDeclaration()) {
+			std::list<std::vector<BasicBlock *>> SCCBBs_list;
+
+			for (scc_iterator<Function*> I = scc_begin(pF); I != scc_end(pF); ++I)
+				SCCBBs_list.push_back(*I);
+
+			while (!SCCBBs_list.empty()) {
+				const std::vector<BasicBlock *> SCCBBs = SCCBBs_list.back();
+				SCCBBs_list.pop_back();
+
+				// Obtain the vector of BBs in this SCC and print it out.
+				for (std::vector<BasicBlock *>::const_iterator BBI = SCCBBs.begin();
+																											 BBI != SCCBBs.end(); ++BBI) {
+					// Handle AllocaInst and CallInst (malloc)
+					handleInstructions(*BBI);
+				}
+			}
+		}
+	}
+
+	while (!work_list.empty()) {
+		AOSAlias *alias = work_list.front();
+		work_list.pop_front();
+
+		//errs() << "Working on this:\n";
+		//alias->getPtr()->dump();
+
+		getPointerAliases(alias);
+	}
+
+	// Resolve memory edge
+	resolveMemoryEdge();
+
+	//dump();
+
+  return false;
+}
+
+void AOSPointerAliasPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+	AU.addRequired<CallGraphWrapperPass>();
+}
+
+AOSPointerAliasPass::AOSNode* AOSPointerAliasPass::getRootNode() {
+	return root_node;
+}
+
+void AOSPointerAliasPass::handleGlobalVariables(Module &M) {
+	for (auto &G : M.getGlobalList()) {
+		GlobalVariable *pGV = dyn_cast<GlobalVariable>(&G);
+
+		// Skip constant GV
+		if (pGV->isConstant())
+			continue;
+
+		AOSNode *new_node = new AOSNode();
+		AOSAlias *alias = new AOSAlias(pGV, new_node);
+		Type *ty = pGV->getType()->getElementType();
+		//unsigned start_idx = get_start_idx(ty);
+
+		new_node->addAlias(alias);
+		new_node->setType(ty);
+		//new_node->ty = ty;
+		//new_node->start_idx = start_idx;
+
+		work_list.push_back(alias);
+		root_node->addSucc(new_node);
+		new_node->addPred(root_node);
+		value_map[pGV] = new_node;
+	}
+}
+
+void AOSPointerAliasPass::handleInstructions(BasicBlock *BB) {
+	for (auto &I : *BB) {
+		switch(I.getOpcode()) {
+			case Instruction::Alloca:
+			{
+				AllocaInst *pAI = dyn_cast<AllocaInst>(&I);
+
+				AOSNode *new_node = new AOSNode();
+				AOSAlias *alias = new AOSAlias(pAI, new_node);
+				Type *ty = pAI->getAllocatedType();
+				//unsigned start_idx = get_start_idx(ty);
+
+				new_node->addAlias(alias);
+				new_node->setType(ty);
+				//new_node->ty = ty;
+				//new_node->start_idx = start_idx;
+
+				work_list.push_back(alias);
+				root_node->addSucc(new_node);
+				new_node->addPred(root_node);
+				value_map[pAI] = new_node;
+
+				break;
+			}
+			case Instruction::Invoke:
+			case Instruction::Call:
+			{
+				Function *pF;
+				//Type *ty;
+
+				if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+					pF = pCI->getCalledFunction();
+					//ty = pCI->getType();
+				} else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I)) {
+					pF = pII->getCalledFunction();
+					//ty = pII->getType();
+				}
+
+				if (!pF) {
+					//TODO for (auto U : I.users()) {
+					//TODO 	if (BitCastInst *pBC = dyn_cast<BitCastInst>(U)) {
+					//TODO 		ty = pBC->getDestTy();
+					//TODO 		break;
+					//TODO 	}
+					//TODO }
+					AOSNode *new_node = new AOSNode();
+					AOSAlias *alias = new AOSAlias(&I, new_node);
+					//unsigned start_idx = get_start_idx(ty);
+
+					new_node->addAlias(alias);
+					//new_node->ty = ty;
+					//new_node->start_idx = start_idx;
+
+					work_list.push_back(alias);
+					root_node->addSucc(new_node);
+					new_node->addPred(root_node);
+					value_map[&I] = new_node;
+				} if (pF && (pF->getName() == "malloc" ||
+										pF->getName() == "calloc" ||
+										pF->getName() == "realloc" ||
+										pF->getName() == "_Znwm" /* new */ ||
+										pF->getName() == "_Znam" /* new[] */)) {
+					// TODO handle type of new[] more specifically
+					//for (auto U : I.users()) {
+					//	if (BitCastInst *pBC = dyn_cast<BitCastInst>(U)) {
+					//		ty = pBC->getDestTy();
+					//		break;
+					//	}
+					//}
+
+					AOSNode *new_node = new AOSNode();
+					AOSAlias *alias = new AOSAlias(&I, new_node);
+					//unsigned start_idx = get_start_idx(ty);
+
+					new_node->addAlias(alias);
+					//new_node->ty = ty;
+					//new_node->start_idx = start_idx;
+
+					work_list.push_back(alias);
+					root_node->addSucc(new_node);
+					new_node->addPred(root_node);
+					value_map[&I] = new_node;
+				}
+
+				break;
+			}
+			default:
+				break;
+		}
+	}
+}
+
+void AOSPointerAliasPass::getPointerAliases(AOSAlias *alias) {
+	AOSNode *cur_node = alias->getNode();
+	Value *pV = alias->getPtr();
+
+	errs() << "Iterate for this value!-- ";
+	pV->dump();
+	for (auto pU: pV->users()) {
+		//if (auto pI = dyn_cast<Instruction>(pU)) {
+		if (auto pI = dyn_cast<Operator>(pU)) {
+			switch (pI->getOpcode()) {
+				case Instruction::Invoke:
+				case Instruction::Call:
+				{
+					//errs() << "Handle CallInst!\n-- ";
+					//pI->dump();
+					Value *arg = getArgument(pU, pV);
+
+					if (arg && !cur_node->findAlias(arg)) {
+						if (cur_node->findAlias(arg)) {
+							AOSAlias *new_alias = new AOSAlias(arg, cur_node);
+							cur_node->addAlias(new_alias);
+							//errs() << "push_front!\n-- ";
+							//arg->dump();
+							work_list.push_front(new_alias);
+							value_map[arg] = cur_node;
+						}
+					}
+
+					break;
+				}
+				case Instruction::Store:
+				{
+					auto pSI = dyn_cast<StoreInst>(pI);
+
+					if (pSI->getValueOperand() == pV) {
+						errs() << "Handle StoreInst!\n-- ";
+						pI->dump();
+						auto ptrOp = pSI->getPointerOperand();
+
+						if (AOSNode *node = value_map[ptrOp]) {
+							node->addStoreEdge(cur_node);
+							node->isMemNode = true;
+							mem_nodes.insert(node);
+						}
+					} else if (pSI->getPointerOperand() == pV) {
+						auto valOp = pSI->getValueOperand();
+						
+						if (AOSNode *node = value_map[valOp]) {
+							cur_node->addStoreEdge(node);
+							cur_node->isMemNode = true;
+							mem_nodes.insert(cur_node);
+						}
+					}
+
+					break;
+				}
+				case Instruction::Load:
+				{
+					LoadInst *pLI = dyn_cast<LoadInst>(pI);
+
+					if (!pLI->getType()->isPointerTy())
+						break;
+
+					errs() << "Handle LoadInst!\n-- ";
+					pI->dump();
+
+					if (AOSNode *node = value_map[pLI]) {
+						pLI->dump();
+						assert(false);
+					} else {
+						//if (AOSNode *load_node = cur_node->load_edge) {
+						//	if (!load_node->findAlias(pLI)) {
+						//		AOSAlias *new_alias = new AOSAlias(pLI, load_node);
+
+						//		load_node->addAlias(new_alias);
+						//		work_list.push_front(new_alias);
+						//		value_map[pLI] = load_node;
+						//	}
+						//} else {
+							AOSNode *new_node = new AOSNode();
+							AOSAlias *new_alias = new AOSAlias(pLI, new_node);
+
+							new_node->addAlias(new_alias);
+							work_list.push_front(new_alias);
+							value_map[pLI] = new_node;
+							cur_node->addLoadEdge(new_node);
+							cur_node->isMemNode = true;
+							mem_nodes.insert(cur_node);
+						//}
+					}
+
+					break;
+				}
+				case Instruction::Ret:
+				{
+					//errs() << "Handle RetInst!\n-- ";
+					//pI->dump();
+					ReturnInst *pRI = dyn_cast<ReturnInst>(pI);
+
+					if (pRI->getReturnValue() == pV) {
+						// this considers Invoke too
+						for (auto pUb: pRI->getFunction()->users()) {
+							if (Instruction *pIb = dyn_cast<Instruction>(pUb)) {
+								Function *pF = pIb->getFunction();
+
+								if (pF && !cur_node->findAlias(pIb)) {
+									AOSAlias *new_alias = new AOSAlias(pIb, cur_node);
+									cur_node->addAlias(new_alias);
+									//errs() << "push_front!\n-- ";
+									//pIb->dump();
+									work_list.push_front(new_alias);
+									break;
+								}
+							}
+						}
+					}
+
+					break;
+				}
+				case Instruction::GetElementPtr:
+				case Instruction::BitCast:
+				{
+					if (!pV->getType()->isPointerTy())
+						break;
+
+					//errs() << "Handle GEP or BitCastInst!\n-- ";
+					//pI->dump();
+					bool chk = false;
+					list<Value *> new_indices;
+
+					if (BitCastOperator *BCOp = dyn_cast<BitCastOperator>(pI)) {
+						if (GetElementPtrInst *pGEP = dyn_cast<GetElementPtrInst>(BCOp->getOperand(0))) {
+							// Not interested in GEPInst... but GEPOp
+						} else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(BCOp->getOperand(0))) {
+							for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+								if (it != GEPOp->idx_begin()) {
+									new_indices.push_back(*it);
+									chk = true;
+								}
+							}
+						}
+					} else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(pI)) {
+						for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+							if (it != GEPOp->idx_begin()) {
+								new_indices.push_back(*it);
+								chk = true;
+							}
+						}
+					}
+
+					AOSNode *node = cur_node;
+
+					if (chk) {
+						if (AOSNode *_node = cur_node->findIndice(new_indices)) {
+							//errs() << "In GEP, found node!\n";
+							node = _node;
+
+						} else {
+							//errs() << "In GEP, new node!\n";
+							AOSNode *new_node = new AOSNode();
+							new_node->indices = new_indices;
+							cur_node->addSucc(new_node);
+							new_node->addPred(cur_node);
+							node = new_node;
+						}
+					}
+
+					if (!node->findAlias(pI)) {
+						AOSAlias *new_alias = new AOSAlias(pI, node);
+						node->addAlias(new_alias);
+						node->setType(pI->getType());
+						//errs() << "push_front!\n-- ";
+						//pI->dump();
+						work_list.push_front(new_alias);
+						value_map[pI] = node;
+					}
+
+					break;
+				}
+				case Instruction::PHI:
+				case Instruction::Select:
+				case Instruction::PtrToInt:
+				case Instruction::IntToPtr:
+				case Instruction::Add:
+				case Instruction::Sub:
+				case Instruction::Shl:
+				//case Instruction::Lshr:
+				//case Instruction::Ashr:
+				case Instruction::And:
+				case Instruction::Or:
+				case Instruction::Xor:
+				case Instruction::SExt: // sign extension
+				{
+					if (!pV->getType()->isPointerTy())
+						break;
+
+					// If the value is already in value_map
+					// merge cur_node with its node.
+					if (AOSNode *node = value_map[pI]) {
+						mergeNode(cur_node, node);
+						break;
+					}
+
+					//errs() << "Handle Else!\n-- ";
+					//pI->dump();
+					if (!cur_node->findAlias(pI)) {
+						AOSAlias *new_alias = new AOSAlias(pI, cur_node);
+						cur_node->addAlias(new_alias);
+						//errs() << "push_front!\n-- ";
+						//pI->dump();
+						work_list.push_front(new_alias);
+						value_map[pI] = cur_node;
+					}
+
+					break;
+				}
+				default:
+					break;
+			} // switch
+		}
+	}
+}
+
+void AOSPointerAliasPass::resolveMemoryEdge() {
+	errs() << "Resolve memory edge!\n";
+
+	for (auto it = mem_nodes.begin(); it != mem_nodes.end(); it++) {
+		//errs() << "mem node!\n";
+		AOSNode *node = (*it);
+
+		//if(node->store_edge.size() == 0) {
+		//	printAliases(node);
+		//	assert(false);
+		//}
+
+		AOSNode *new_node = new AOSNode();
+
+		for (auto itb = node->store_edge.begin(); itb != node->store_edge.end(); itb++) {
+			//errs() << "store node!\n";
+			AOSNode *store_node = (*itb);
+			mergeNode(new_node, store_node);
+
+			//new_node->predecessors.insert(store_node->predecessors.begin(), store_node->predecessors.end());
+			//for (auto itc = store_node->predecessors.begin(); itc != store_node->predecessors.end(); itc++) {
+			//	// if store_node is mem_node and already merged??
+
+			//	AOSNode *pred_node = (*itc);
+			//	pred_node->removeSucc(store_node);
+			//	pred_node->addSucc(new_node);
+			//}
+
+			//new_node->successors.insert(store_node->successors.begin(), store_node->successors.end());
+			//for (auto itc = store_node->successors.begin(); itc != store_node->successors.end(); itc++) {
+			//	AOSNode *succ_node = (*itc);
+			//	succ_node->removePred(store_node);
+			//	succ_node->addPred(new_node);
+			//}
+
+			//new_node->aliases.insert(store_node->aliases.begin(), store_node->aliases.end());
+		}
+
+		for (auto itb = node->load_edge.begin(); itb != node->load_edge.end(); itb++) {
+			//errs() << "load node!\n";
+			AOSNode *load_node = (*itb);
+			mergeNode(new_node, load_node);
+
+			//new_node->predecessors.insert(load_node->predecessors.begin(), load_node->predecessors.end());
+			//for (auto itc = load_node->predecessors.begin(); itc != load_node->predecessors.end(); itc++) {
+			//	AOSNode *pred_node = (*itc);
+			//	pred_node->removeSucc(load_node);
+			//	pred_node->addSucc(new_node);
+			//}
+
+			//new_node->successors.insert(load_node->successors.begin(), load_node->successors.end());
+			//for (auto itc = load_node->successors.begin(); itc != load_node->successors.end(); itc++) {
+			//	AOSNode *succ_node = (*itc);
+			//	succ_node->removePred(load_node);
+			//	succ_node->addPred(new_node);
+			//}
+			//new_node->aliases.insert(load_node->aliases.begin(), load_node->aliases.end());
+		}
+
+		
+	}
+
+//	list<AOSNode *> node_list;
+//
+//	for (auto it = root_node->successors.begin(); it != root_node->successors.end(); it++) {
+//		node_list.push_back(*it);
+//	}
+//
+//	while (!node_list.empty()) {
+//		AOSNode *node = node_list.front();
+//		node_list.pop_front();
+//
+//		handleStoreEdge(node);
+//	}
+}
+
+void AOSPointerAliasPass::mergeNode(AOSNode *dst, AOSNode *src) {
+	dst->predecessors.insert(src->predecessors.begin(), src->predecessors.end());
+	for (auto itc = src->predecessors.begin(); itc != src->predecessors.end(); itc++) {
+		// if src is mem_node and already merged??
+
+		AOSNode *pred_node = (*itc);
+		pred_node->removeSucc(src);
+		pred_node->addSucc(dst);
+	}
+
+	dst->successors.insert(src->successors.begin(), src->successors.end());
+	for (auto itc = src->successors.begin(); itc != src->successors.end(); itc++) {
+		AOSNode *succ_node = (*itc);
+		succ_node->removePred(src);
+		succ_node->addPred(dst);
+	}
+
+	dst->aliases.insert(src->aliases.begin(), src->aliases.end());
+	for (auto itc = src->aliases.begin(); itc != src->aliases.end(); itc++) {
+		AOSAlias *alias = itc->second;
+		alias->setNode(dst);
+	}
+
+	if (src->isMemNode)
+		dst->isMemNode = true;
+
+	// TODO type, indices...?
+}
+
+
+
+void AOSPointerAliasPass::handleStoreEdge(AOSNode *node) {
+	errs() << "handleStoreEdge!\n";
+	printAliases(node);
+
+	for (auto it = node->store_edge.begin(); it != node->store_edge.end(); it++) {
+		AOSNode *store_node = (*it);
+
+		handleStoreEdge(store_node);
+
+		//if (AOSNode *load_node = store_node->load_edge)	
+		//	node->addSucc(load_node);
+
+		//for (auto itb = store_node->successors.begin(); itb != store_node->successors.end(); itb++) {
+		//	if (AOSNode *load_node = (*itb)->load_edge)
+		//		node->addSucc(load_node);
+		//}
+	}
+}
+
+
+int AOSPointerAliasPass::get_start_idx(Type *ty) {
+	int start_idx = 0;
+
+	while (ty->isArrayTy()) {
+		ty = ty->getArrayElementType();
+		start_idx++;
+	}
+
+	return start_idx;
+}
+
+
+Value *AOSPointerAliasPass::getArgument(Value *pI, Value *pV) {
+	Function *pF;
+
+	if (InvokeInst *pII = dyn_cast<InvokeInst>(pI))
+		pF = pII->getCalledFunction();
+	else if (CallInst *pCI = dyn_cast<CallInst>(pI))
+		pF = pCI->getCalledFunction();
+	else
+		assert(false);
+
+	//TODO can intrinsic func return pointer alias?
+	if (pF && !pF->isVarArg() && !pF->isDeclaration()) {
+		unsigned arg_nth = 0;
+
+		if (InvokeInst *pII = dyn_cast<InvokeInst>(pI)) {
+			for (auto arg = pII->arg_begin(); arg != pII->arg_end(); ++arg) {
+				if (dyn_cast<Value>(arg) == pV)
+					break;
+
+				arg_nth++;
+			}
+
+			assert(arg_nth < pII->arg_size());
+		}	else if (CallInst *pCI = dyn_cast<CallInst>(pI)) {
+			for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+				if (dyn_cast<Value>(arg) == pV)
+					break;
+
+				arg_nth++;
+			}
+
+			assert(arg_nth < pCI->arg_size());
+		}
+
+		assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+		unsigned t = 0;
+		for (auto arg = pF->arg_begin(); arg != pF->arg_end(); arg++) {
+			if (t++ == arg_nth)
+				return arg;
+		}
+	}
+
+	return nullptr;
+}
+
+void AOSPointerAliasPass::getFunctionsFromCallGraph(Module &M) {
+	CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+	list<CallGraphNode *> cgn_list;
+	CallGraphNode *cgn = CG[M.getFunction("main")];
+
+	cgn_list.push_back(cgn);
+	func_list.push_back(M.getFunction("main"));
+
+	while (!cgn_list.empty()) {
+		CallGraphNode *caller = cgn_list.front();
+		cgn_list.pop_front();
+
+		//errs() << "Caller: " << caller->getFunction()->getName() << "\n";
+		for (auto it = caller->begin(); it != caller->end(); it++) {
+			if (CallGraphNode *callee = it->second) {
+				Function *pF = callee->getFunction();
+
+				if (pF && !pF->isDeclaration() &&
+					caller->getFunction() != callee->getFunction()) {
+
+					if (find(func_list.begin(), func_list.end(), pF) == func_list.end()) {
+						//errs() << "--Callee: " << pF->getName() << "\n";
+						func_list.push_back(pF);
+						cgn_list.push_back(callee);
+					}
+				}
+			}
+		}
+	}
+
+	//// TODO need special care... cuz arg will not be examined...
+	for (auto &F : M) {
+		if (&F && !F.isDeclaration() &&
+			find(func_list.begin(), func_list.end(), &F) == func_list.end())
+			func_list.push_back(&F);
+	}
+
+	//for (auto it = func_map.begin(); it != func_map.end(); it++) {
+	//	Function *pF = it->first;
+	//	errs() << "pF->getName(): " << pF->getName() << "\n";
+	//}
+}
+
+void AOSPointerAliasPass::dump() {
+	errs() << "Start dump!\n";
+
+	list<AOSNode *> node_list;
+
+	for (auto it = root_node->successors.begin(); it != root_node->successors.end(); it++) {
+		node_list.push_back(*it);
+	}
+
+	while (!node_list.empty()) {
+		AOSNode *node = node_list.front();
+		node_list.pop_front();
+
+		errs() << "Print Aliases! isMemnode: " << (node->isMemNode ? "True" : "False") << "\n";
+		printAliases(node);
+
+		for (auto it = node->successors.begin(); it != node->successors.end(); it++) {
+			node_list.push_back(*it);
+		}
+
+		errs() << "Print StoreEdge's aliases!\n";
+		for (auto it = node->store_edge.begin(); it != node->store_edge.end(); it++) {
+			printAliases(*it);
+
+			//for (auto itb = (*it)->successors.begin(); itb != (*it)->successors.end(); itb++) {
+			//	node_list.push_back(*itb);
+			//}
+		}
+
+		errs() << "Print LoadEdge's aliases!\n";
+		for (auto it = node->load_edge.begin(); it != node->load_edge.end(); it++) {
+			printAliases(*it);
+
+			//for (auto itb = (*it)->successors.begin(); itb != (*it)->successors.end(); itb++) {
+			//	node_list.push_back(*itb);
+			//}
+		}
+		errs() << "--------------------------\n";
+
+
+	}
+}
+
+void AOSPointerAliasPass::printAliases(AOSNode *node) {
+	for (auto it = node->aliases.begin(); it != node->aliases.end(); it ++) {
+		it->first->dump();
+	}
+}
+

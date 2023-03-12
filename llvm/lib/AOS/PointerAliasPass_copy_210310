@@ -1,0 +1,593 @@
+#include "llvm/AOS/AOSPointerAliasPass.h"
+
+char AOSPointerAliasPass::ID = 0;
+
+static RegisterPass<AOSPointerAliasPass> X("aos-alias", "AOS pointer alias pass");
+
+Pass *llvm::AOS::createAOSPointerAliasPass() { return new AOSPointerAliasPass(); }
+
+bool AOSPointerAliasPass::runOnModule(Module &M) {
+	// Handle global variables
+	handleGlobalVariables(M);
+
+	//handleCommandLineArguments();
+
+	getFunctionsFromCallGraph(M);
+
+	for (auto it = aos_cgns.begin(); it != aos_cgns.end(); it++) {
+		Function *pF = (*it)->getCGN()->getFunction();
+		list<Function *> context = (*it)->getContext();
+
+		if (pF && !pF->isDeclaration()) {
+			//errs() << "pF->getName(): " << pF->getName() << "\n";
+			std::list<std::vector<BasicBlock *>> SCCBBs_list;
+
+			for (scc_iterator<Function*> I = scc_begin(pF); I != scc_end(pF); ++I)
+				SCCBBs_list.push_back(*I);
+
+			while (!SCCBBs_list.empty()) {
+				const std::vector<BasicBlock *> SCCBBs = SCCBBs_list.back();
+				SCCBBs_list.pop_back();
+
+				// Obtain the vector of BBs in this SCC and print it out.
+				//const std::vector<BasicBlock *> &SCCBBs = *I;
+				//outs() << "  SCC: ";
+				for (std::vector<BasicBlock *>::const_iterator BBI = SCCBBs.begin();
+																											 BBI != SCCBBs.end(); ++BBI) {
+					// Handle AllocaInst and CallInst (malloc)
+					handleInstructions(*BBI, context);
+					//outs() << (*BBI)->getName() << "  ";
+				}
+				//outs() << "\n";
+			}
+		}
+	}
+
+	int time_stamp = 0;
+	while (!work_list.empty()) {
+		AOSAlias *alias = work_list.front();
+		work_list.pop_front();
+
+		//alias->ptr->dump();
+		//dump();
+
+		getPointerAliases(alias);
+
+		//if (time_stamp > 1000) {
+		//	time_stamp = 0;
+		//}
+		//time_stamp++;
+	}
+
+	dump();
+
+  return false;
+}
+
+
+void AOSPointerAliasPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+	AU.addRequired<CallGraphWrapperPass>();
+}
+
+AOSPointerAliasPass::AOSAliasMap AOSPointerAliasPass::getAliasMap() {
+	return alias_map;
+}
+
+void AOSPointerAliasPass::handleGlobalVariables(Module &M) {
+	for (auto &G : M.getGlobalList()) {
+		GlobalVariable *pGV = dyn_cast<GlobalVariable>(&G);
+
+		// Skip constant GV
+		if (pGV->isConstant())
+			continue;
+
+		AOSNode *root_node = new AOSNode();
+		AOSAlias *alias = new AOSAlias(pGV, root_node);
+		Type *ty = pGV->getType()->getElementType();
+		unsigned start_idx = get_start_idx(ty);
+
+		root_node->addAlias(alias);
+		root_node->start_idx = start_idx;
+		root_node->root_node = root_node;
+
+		work_list.push_back(alias);
+		alias_map.addNode(root_node);
+	}
+}
+
+void AOSPointerAliasPass::handleInstructions(BasicBlock *BB, list<Function *> context) {
+	for (auto &I : *BB) {
+		switch(I.getOpcode()) {
+			case Instruction::Alloca:
+			{
+				AllocaInst *pAI = dyn_cast<AllocaInst>(&I);
+
+				AOSNode *root_node = new AOSNode();
+				AOSAlias *alias = new AOSAlias(pAI, root_node, context);
+				Type *ty = pAI->getAllocatedType();
+				unsigned start_idx = get_start_idx(ty);
+
+				root_node->addAlias(alias);
+				root_node->start_idx = start_idx;
+				root_node->root_node = root_node;
+
+				work_list.push_back(alias);
+				alias_map.addNode(root_node);
+
+				break;
+			}
+			case Instruction::Invoke:
+			case Instruction::Call:
+			{
+				Function *pF;
+				Type *ty;
+
+				if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+					pF = pCI->getCalledFunction();
+					ty = pCI->getType();
+
+					errs() << "Found CallInst!\n";
+					pCI->dump();
+					if (pF)
+						errs() << "pF->getName(): " << pF->getName() << "\n";
+
+				} else if (InvokeInst *pII = dyn_cast<InvokeInst>(&I)) {
+					pF = pII->getCalledFunction();
+					ty = pII->getType();
+				}
+
+				if (!pF) {
+					for (auto U : I.users()) {
+						if (BitCastInst *pBC = dyn_cast<BitCastInst>(U)) {
+							ty = pBC->getDestTy();
+							break;
+						}
+					}
+
+					AOSNode *root_node = new AOSNode();
+					AOSAlias *alias = new AOSAlias(&I, root_node, context);
+					unsigned start_idx = get_start_idx(ty);
+
+					root_node->addAlias(alias);
+					root_node->start_idx = start_idx;
+					root_node->root_node = root_node;
+
+					work_list.push_back(alias);
+					alias_map.addNode(root_node);
+				} if (pF && (pF->getName() == "malloc" ||
+										pF->getName() == "calloc" ||
+										pF->getName() == "realloc" ||
+										pF->getName() == "_Znwm" /* new */ ||
+										pF->getName() == "_Znam" /* new[] */)) {
+
+					// TODO handle type of new[] more specifically
+					for (auto U : I.users()) {
+						if (BitCastInst *pBC = dyn_cast<BitCastInst>(U)) {
+							ty = pBC->getDestTy();
+							break;
+						}
+					}
+
+					AOSNode *root_node = new AOSNode();
+					AOSAlias *alias = new AOSAlias(&I, root_node, context);
+					unsigned start_idx = get_start_idx(ty);
+
+					root_node->addAlias(alias);
+					root_node->start_idx = start_idx;
+					root_node->root_node = root_node;
+
+					work_list.push_back(alias);
+					alias_map.addNode(root_node);
+				}
+
+				break;
+			}
+			default:
+				break;
+		}
+	}
+}
+
+void AOSPointerAliasPass::getPointerAliases(AOSAlias *alias) {
+	AOSNode *cur_node = alias->getNode();
+	list<Function *> cur_context = alias->context;
+	Value *pV = alias->getPtr();
+
+	errs() << "Iterate for this value!-- ";
+	pV->dump();
+	for (auto pU: pV->users()) {
+		//if (auto pI = dyn_cast<Instruction>(pU)) {
+		if (auto pI = dyn_cast<Operator>(pU)) {
+			switch (pI->getOpcode()) {
+				case Instruction::Invoke:
+				case Instruction::Call:
+				{
+					errs() << "Handle CallInst!\n-- ";
+					pI->dump();
+					Value *arg = getArgument(pU, pV);
+
+					if (arg && !cur_node->findCurNode(arg)) {
+						AOSAlias *new_alias = new AOSAlias(arg, cur_node, cur_context);
+						new_alias->addContext(dyn_cast<Instruction>(pI)->getFunction()); // concatenate
+						cur_node->addAlias(new_alias);
+						errs() << "push_front!\n-- ";
+						arg->dump();
+						work_list.push_front(new_alias);
+					}
+
+					break;
+				}
+				case Instruction::Store:
+				{
+					auto pSI = dyn_cast<StoreInst>(pI);
+
+					if (pSI->getValueOperand() == pV) {
+						errs() << "Handle StoreInst!\n-- ";
+						pI->dump();
+						auto ptrOp = pSI->getPointerOperand();
+
+						// ptrOp could be already in mem_users
+						if (AOSNode *node = alias_map.getNode(ptrOp)) {
+							node->addMemUserNode(cur_node);
+
+							for (auto it = node->aliases.begin(); it != node->aliases.end(); it++) {
+								Value *mem_ptr = (*it)->getPtr();
+								for (auto mem_user: mem_ptr->users()) {
+									if (auto pLI = dyn_cast<LoadInst>(mem_user)) {
+										if (!cur_node->findCurNode(pLI)) {
+											AOSAlias *new_alias = new AOSAlias(pLI, cur_node, cur_context);
+											cur_node->addAlias(new_alias);
+											errs() << "(1) push_front!\n-- ";
+											pLI->dump();
+											work_list.push_front(new_alias);
+										}
+									}
+								}
+							}
+						} else {
+							// Couldn't find alise(s) of pointer op, retry later
+							errs() << "(2) push_back!\n-- ";
+							pI->dump();
+							work_list.push_back(alias);
+						}
+					}
+
+					break;
+				}
+				case Instruction::Load:
+				{
+					errs() << "Handle LoadInst!\n-- ";
+					pI->dump();
+					LoadInst *pLI = dyn_cast<LoadInst>(pI);
+
+					for (auto it = cur_node->mem_nodes.begin(); it != cur_node->mem_nodes.end(); it++) {
+						AOSNode *mem_node = (*it);
+
+						if (!mem_node->findCurNode(pLI)) {
+							// TODO is this context correct?
+							AOSAlias *new_alias = new AOSAlias(pLI, mem_node, cur_context);
+							mem_node->addAlias(new_alias);
+							errs() << "push_front!\n-- ";
+							pLI->dump();
+							work_list.push_front(new_alias); // TODO front? back?
+						}
+					}
+
+					break;
+				}
+				case Instruction::Ret:
+				{
+					errs() << "Handle RetInst!\n-- ";
+					pI->dump();
+					ReturnInst *pRI = dyn_cast<ReturnInst>(pI);
+
+					if (pRI->getReturnValue() == pV) {
+						list<Function *> new_context = alias->getContext();
+
+						if (new_context.size() == 0) {
+							// no context, probably coming from global variable
+							for (auto pUb: pRI->getFunction()->users()) {
+								if (Instruction *pIb = dyn_cast<Instruction>(pUb)) {
+									Function *pF = pIb->getFunction();
+
+									if (pF && !cur_node->findCurNode(pIb)) {
+										// Only caller function... this considers Invoke too
+										AOSAlias *new_alias = new AOSAlias(pIb, cur_node, new_context);
+										cur_node->addAlias(new_alias);
+										errs() << "push_front!\n-- ";
+										pIb->dump();
+										work_list.push_front(new_alias);
+										break;
+									}
+								}
+							}
+						} else {
+							Function *caller = new_context.back();
+							new_context.pop_back();
+
+							errs() << "Caller's name: " << caller->getName() << "\n";
+							errs() << "pRI->getFunction: " << pRI->getFunction()->getName() << "\n";
+
+							for (auto pUb: pRI->getFunction()->users()) {
+								if (Instruction *pIb = dyn_cast<Instruction>(pUb)) {
+									Function *pF = pIb->getFunction();
+
+									if (pF && pF == caller &&
+												!cur_node->findCurNode(pIb)) {
+										// Only caller function... this considers Invoke too
+										AOSAlias *new_alias = new AOSAlias(pIb, cur_node, new_context);
+										cur_node->addAlias(new_alias);
+										errs() << "push_front!\n-- ";
+										pIb->dump();
+										work_list.push_front(new_alias);
+										break;
+									}
+								}
+							}
+						}
+					}
+
+					break;
+				}
+				case Instruction::GetElementPtr:
+				case Instruction::BitCast:
+				{
+					errs() << "Handle GEP or BitCastInst!\n-- ";
+					pI->dump();
+					bool chk = false;
+					list<Value *> new_indice = cur_node->indice;
+
+					if (BitCastOperator *BCOp = dyn_cast<BitCastOperator>(pI)) {
+						if (GetElementPtrInst *pGEP = dyn_cast<GetElementPtrInst>(BCOp->getOperand(0))) {
+							// Not interested in GEPInst... but GEPOp
+						} else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(BCOp->getOperand(0))) {
+							for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+								if (it != GEPOp->idx_begin()) {
+									new_indice.push_back(*it);
+									chk = true;
+								}
+							}
+						}
+					} else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(pI)) {
+						for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++) {
+							if (it != GEPOp->idx_begin()) {
+								new_indice.push_back(*it);
+								chk = true;
+							}
+						}
+					}
+
+					if (chk) {
+						AOSNode *root_node = cur_node->root_node;
+
+						if (AOSNode *node = root_node->findIndice(new_indice)) {
+							if (!node->findCurNode(pI)) {
+								AOSAlias *new_alias = new AOSAlias(pI, node, cur_context);
+								node->addAlias(new_alias);
+								errs() << "GEP-(1) push_front!\n-- ";
+								pI->dump();
+								work_list.push_front(new_alias);
+							}
+						} else {
+							AOSNode *new_node = new AOSNode();
+							AOSAlias *new_alias = new AOSAlias(pI, new_node, cur_context);
+
+							new_node->addAlias(new_alias);
+							new_node->start_idx = root_node->start_idx;
+							new_node->indice = new_indice;
+							new_node->root_node = root_node;
+
+							root_node->addAdjNode(new_node);
+
+							errs() << "GEP-(2) push_front!\n-- ";
+							pI->dump();
+							work_list.push_front(new_alias);
+						}
+					} else {
+						if (!cur_node->findCurNode(pI)) {
+							AOSAlias *new_alias = new AOSAlias(pI, cur_node, cur_context);
+							cur_node->addAlias(new_alias);
+							errs() << "GEP-(3) push_front!\n-- ";
+							pI->dump();
+							work_list.push_front(new_alias);
+						} else {
+							errs() << "else (3)\n";
+						}
+					}
+
+					break;
+				}
+				case Instruction::Select:
+				case Instruction::PHI:
+				case Instruction::PtrToInt:
+				case Instruction::IntToPtr:
+				case Instruction::Add:
+				case Instruction::Sub:
+				case Instruction::Shl:
+				//case Instruction::Lshr:
+				//case Instruction::Ashr:
+				case Instruction::And:
+				case Instruction::Or:
+				case Instruction::Xor:
+				case Instruction::SExt: // sign extension
+				{
+					errs() << "Handle Else!\n-- ";
+					pI->dump();
+					//errs() << "Handle Inst!\n";
+					if (!cur_node->findCurNode(pI)) {
+						AOSAlias *new_alias = new AOSAlias(pI, cur_node, cur_context);
+						cur_node->addAlias(new_alias);
+						errs() << "push_front!\n-- ";
+						pI->dump();
+						work_list.push_front(new_alias);
+					}
+					break;
+				}
+				default:
+					break;
+			} // switch
+		} 
+	}
+}
+
+int AOSPointerAliasPass::get_start_idx(Type *ty) {
+	int start_idx = 0;
+
+	while (ty->isArrayTy()) {
+		ty = ty->getArrayElementType();
+		start_idx++;
+	}
+
+	return start_idx;
+}
+
+
+Value *AOSPointerAliasPass::getArgument(Value *pI, Value *pV) {
+	Function *pF;
+
+	if (InvokeInst *pII = dyn_cast<InvokeInst>(pI))
+		pF = pII->getCalledFunction();
+	else if (CallInst *pCI = dyn_cast<CallInst>(pI))
+		pF = pCI->getCalledFunction();
+	else
+		assert(false);
+
+	//TODO can intrinsic func return pointer alias?
+	if (pF && !pF->isVarArg() && !pF->isDeclaration()) {
+		unsigned arg_nth = 0;
+
+		if (InvokeInst *pII = dyn_cast<InvokeInst>(pI)) {
+			for (auto arg = pII->arg_begin(); arg != pII->arg_end(); ++arg) {
+				if (dyn_cast<Value>(arg) == pV)
+					break;
+
+				arg_nth++;
+			}
+
+			assert(arg_nth < pII->arg_size());
+		}	else if (CallInst *pCI = dyn_cast<CallInst>(pI)) {
+			for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+				if (dyn_cast<Value>(arg) == pV)
+					break;
+
+				arg_nth++;
+			}
+
+			assert(arg_nth < pCI->arg_size());
+		}
+
+		assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+		unsigned t = 0;
+		for (auto arg = pF->arg_begin(); arg != pF->arg_end(); arg++) {
+			if (t++ == arg_nth)
+				return arg;
+		}
+	}
+
+	return nullptr;
+}
+
+void AOSPointerAliasPass::getFunctionsFromCallGraph(Module &M) {
+	CallGraph &CG = getAnalysis<CallGraphWrapperPass>().getCallGraph();
+	list<AOSCGN *> cgn_list;
+	AOSCGN *_aos_cgn = new AOSCGN(CG[M.getFunction("main")]);
+	//_aos_cgn.addContext(M.getFunction("main"));
+
+	cgn_list.push_back(_aos_cgn);
+	aos_cgns.push_back(_aos_cgn);
+
+	// context-aware...
+	while (!cgn_list.empty()) {
+		AOSCGN *aos_cgn = cgn_list.front();
+		cgn_list.pop_front();
+		CallGraphNode *caller = aos_cgn->getCGN();
+		list<Function *> new_context = aos_cgn->getContext();
+		new_context.push_back(caller->getFunction());
+
+		errs() << "Caller: " << caller->getFunction()->getName() << "\n";
+
+		list<Function *> visit_list;
+		for (auto it = caller->begin(); it != caller->end(); it++) {
+			if (CallGraphNode *callee = it->second) {
+				Function *pF = callee->getFunction();
+
+				if (pF && !pF->isDeclaration() &&
+					caller->getFunction() != callee->getFunction()) {
+					if (find(visit_list.begin(), visit_list.end(), pF) != visit_list.end()) {
+						//errs() << "--Skip this: " << pF->getName() << "\n";
+						continue;
+					}
+
+					visit_list.push_back(pF);
+
+					errs() << "--Callee: " << pF->getName() << "\n";
+
+					AOSCGN *new_cgn = new AOSCGN(callee);
+					new_cgn->setContext(new_context);
+
+					cgn_list.push_back(new_cgn);
+					aos_cgns.push_back(new_cgn);
+				}
+			}
+		}
+	}
+
+	for (auto it = aos_cgns.begin(); it != aos_cgns.end(); it++) {
+		Function *pF = (*it)->getCGN()->getFunction();
+		list<Function *> context = (*it)->getContext();
+
+		errs() << "Function: " << pF->getName() << "\n";
+		errs() << "Context: ";
+		for (auto itb = context.begin(); itb != context.end(); itb++) {
+			errs() << (*itb)->getName() << " ";
+		}
+		errs() << "\n";
+	}
+
+	//// TODO need special care... cuz arg will not be examined...
+	//for (auto &F : M) {
+	//	if (std::find(func_list.begin(), func_list.end(), &F) == func_list.end()) {
+	//		errs() << "[Late] Pushing this function! " << F.getName() << "\n";
+	//		func_list.push_back(&F);
+	//	}
+	//}
+}
+
+void AOSPointerAliasPass::dump() {
+	errs() << "Start dump!\n";
+	for (auto it = alias_map.root_nodes.begin(); it != alias_map.root_nodes.end(); it++) {
+		list<AOSNode *> node_list;
+		node_list.push_back(*it);
+
+		while (!node_list.empty()) {
+			AOSNode *node = node_list.front();
+			node_list.pop_front();
+
+			errs() << "Print AOSNode!\n";
+			for (auto itb = node->aliases.begin(); itb != node->aliases.end(); itb++) {
+				errs() << "--";
+				(*itb)->ptr->dump();
+			}
+
+			errs() << "--Print index!\n";
+			for (auto itb = node->indice.begin(); itb != node->indice.end(); itb++) {
+				errs() << "----";
+				(*itb)->dump();
+			}
+
+			errs() << "--Print MemNode!\n";
+			for (auto itb = node->mem_nodes.begin(); itb != node->mem_nodes.end(); itb++) {
+				for (auto itc = (*itb)->aliases.begin(); itc != (*itb)->aliases.end(); itc++) {
+					errs() << "----";
+					(*itc)->ptr->dump();
+				}
+			}
+
+			for (auto itb = node->adj_nodes.begin(); itb != node->adj_nodes.end(); itb++) {
+				node_list.push_back(*itb);
+			}
+		}
+	}
+}

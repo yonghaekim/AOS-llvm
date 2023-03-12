@@ -1,0 +1,669 @@
+#include "llvm/AOS/AOSReachTestPass.h"
+
+#define PARTS_USE_SHA3
+
+extern "C" {
+#include "../PARTS-sha3/include/sha3.h"
+}
+
+char AOSReachTestPass::ID = 0;
+static RegisterPass<AOSReachTestPass> X("aos-reach", "AOS reacheability test pass");
+
+Pass *llvm::AOS::createAOSReachTestPass() { return new AOSReachTestPass(); }
+
+bool AOSReachTestPass::runOnModule(Module &M) {
+	bool function_modified = false;
+
+	force_sign = true;
+
+	errs() << "Start reachability test pass!\n";
+  AOSMarkTaintPass &MT = getAnalysis<AOSMarkTaintPass>();
+  value_map = MT.getValueMap();
+
+	init(M);
+
+  function_modified = handleGlobalVariables(M) || function_modified;
+
+  function_modified = handleInstructions(M) || function_modified;
+
+	errs() << "statNumGV: " << statNumGV << "\n";
+	errs() << "statNumGVSigned: " << statNumGVSigned << "\n";
+	errs() << "statNumAI: " << statNumAI << "\n";
+	errs() << "statNumAISigned: " << statNumAISigned << "\n";
+	errs() << "statNumCI: " << statNumCI << "\n";
+	errs() << "statNumCISigned: " << statNumCISigned << "\n";
+
+  return function_modified;
+}
+
+void AOSReachTestPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+  AU.addRequired<AOSMarkTaintPass> ();
+}
+
+bool AOSReachTestPass::handleGlobalVariables(Module &M) {
+	bool function_modified = false;
+
+	for (auto &G : M.getGlobalList()) {
+		GlobalVariable *pGV = dyn_cast<GlobalVariable>(&G);
+		Type *ty = pGV->getType()->getElementType();
+
+		if (pGV->isConstant() && pGV->getName().find(".str") == 0)
+			continue;
+
+		// Skip constant GV
+		if (pGV->use_empty() ||
+				!(ty->isArrayTy() || ty->isStructTy()))
+			continue;
+
+		statNumGV++;
+    //bool needSign = doReachabilityTest(value_map[pGV]);
+
+		if (force_sign || doReachabilityTest(value_map[pGV])) {
+			gv_list.push_back(pGV);
+			statNumGVSigned++;
+		}
+  }
+
+	for (auto &F : M) {
+		if (&F && F.getName() == "main") {
+			while (!gv_list.empty()) {
+				GlobalVariable *pGV = dyn_cast<GlobalVariable>(gv_list.front());
+				gv_list.pop_front();
+				Type *ty = pGV->getType()->getElementType();
+
+				if (ty->isArrayTy() || ty->isStructTy())
+					handleGlobalVariable(&F, pGV);				
+			}
+
+			break;
+		}
+	}
+	
+	return function_modified;
+}
+
+map<Instruction *, list<Operator *>> inst_map;
+
+void getUsersOfGV(Value *pV, list<Operator *> op_list) {
+	for (auto pU: pV->users()) {
+		if (auto *pI = dyn_cast<Instruction>(pU)) {
+			inst_map[pI] = op_list;
+		} else if (auto *pOp = dyn_cast<Operator>(pU)) {
+			list<Operator *> op_list_new = op_list;
+			op_list_new.push_back(pOp);
+			getUsersOfGV(pOp, op_list_new);
+		}
+	}
+}
+	
+bool AOSReachTestPass::handleGlobalVariable(Function *pF, GlobalVariable *pGV) {
+	map<Function *, Value *> func_map;
+	set<Instruction *> inst_set;
+	list<Operator *> op_list;
+
+	getUsersOfGV(pGV, op_list);
+
+	Type *ty = pGV->getType()->getElementType();
+	auto size = DL->getTypeSizeInBits(ty);
+	Value *arg = ConstantInt::get(Type::getInt64Ty(*C), size / 8);
+
+	for (auto &x: inst_map) {
+		auto pI = x.first;
+		auto list = x.second;
+		auto pF = pI->getFunction();
+
+		auto &BB = pF->front();
+		auto &I = BB.front();
+
+		//Value *cur_val;
+		Value *cur_val = func_map[pF];
+
+		if (cur_val == nullptr) {
+			IRBuilder<> Builder(&I);
+			FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+			auto typeIdConstant = getTypeIDConstantFrom(*ty, *C);
+			auto castA = Builder.CreateCast(Instruction::BitCast, pGV, Type::getInt8PtrTy(*C));
+			Constant *promote = pF->getParent()->getOrInsertFunction("_Z17wyfy_promote_basePvmm", FuncTypeA);
+			auto callA = Builder.CreateCall(promote, {castA, arg, typeIdConstant});
+			auto castB = Builder.CreateCast(Instruction::BitCast, callA, pGV->getType());
+
+			cur_val = castB;
+			func_map[pF] = castB;
+		}
+
+		IRBuilder<> Builder(dyn_cast<Instruction>(cur_val)->getNextNode());
+
+		for (auto pOp: list) {
+			if (auto GEPOp = dyn_cast<GEPOperator>(pOp)) {
+				vector<Value *> indices;
+
+				for (auto it = GEPOp->idx_begin(); it != GEPOp->idx_end(); it++)
+					indices.push_back(*it);
+
+				cur_val = Builder.CreateGEP(cur_val, indices);
+
+				if (GEPOp->getNumIndices() > 2) {
+					errs() << "GEPOp->dump(): "; GEPOp->dump();
+				}
+
+			} else if (auto BCOp = dyn_cast<BitCastOperator>(pOp)) {
+				cur_val = Builder.CreateCast(Instruction::BitCast, cur_val, BCOp->getDestTy());
+			} else if (auto PTIOp = dyn_cast<PtrToIntOperator>(pOp)) {
+				cur_val = Builder.CreatePtrToInt(cur_val, PTIOp->getType());
+			} else {
+				pOp->dump();
+				assert(false);
+			}
+		}
+
+		unsigned cnt = 0;
+		unsigned l_size = list.size();
+		bool chk = false;
+		for (auto it = pI->op_begin(); it != pI->op_end(); it++) {
+			if ((l_size == 0 && (*it) == pGV) ||
+					(l_size != 0 && (*it) == list.back())) {
+				pI->setOperand(cnt, cur_val);
+				chk = true;
+				break;
+			}
+				
+			cnt++;
+		}
+
+		assert(chk);
+	}
+
+	inst_map.clear();
+
+	handleStruct(pF, pGV);
+
+	return true;
+}
+
+void AOSReachTestPass::replaceUsesInFunction(Value *pV, Value *pNew, Function *pF) {
+	for (auto it = pV->use_begin(); it != pV->use_end(); it++) {
+		Use &U = *it;
+		User *pU = U.getUser();
+
+		errs() << "pU->dump(): "; pU->dump();
+		if (auto *pI = dyn_cast<Instruction>(pU)) {
+			if (pI->getFunction() == pF)
+				U.set(pNew);
+		}
+	}
+}
+
+bool AOSReachTestPass::handleInstructions(Module &M) {
+  bool function_modified = false;
+
+	for (auto &F : M) {
+		for (auto &BB : F) {
+			for (auto &I : BB) {
+        switch (I.getOpcode()) {
+          case Instruction::Alloca:
+          {
+            AllocaInst *pAI = dyn_cast<AllocaInst>(&I);
+						Type *ty = pAI->getAllocatedType();
+						Function *pF = pAI->getFunction();
+
+						if (ty->isArrayTy() || ty->isStructTy()) {
+								statNumAI++;
+							//bool needSign = doReachabilityTest(value_map[pAI]);
+
+							if (force_sign || doReachabilityTest(value_map[pAI])) {
+								statNumAISigned++;
+                inst_list.push_back(pAI);
+							}
+						}
+
+            break;
+          }
+          case Instruction::Call:
+          {
+						CallInst *pCI = dyn_cast<CallInst>(&I);
+            Function *pF = pCI->getCalledFunction();
+
+            if (pF && (pF->getName() == "malloc" ||
+                        pF->getName() == "_Znwm" /* new */ ||
+                        pF->getName() == "_Znam" /* new[] */ ||
+                        pF->getName() == "calloc" ||
+                        pF->getName() == "realloc")) {
+							statNumCI++;
+
+					    //bool needSign = doReachabilityTest(value_map[&I]);
+
+							if (force_sign || doReachabilityTest(value_map[&I])) {
+								statNumCISigned++;
+                inst_list.push_back(pCI);
+							}
+            } else if (pF && (pF->getName() == "free" ||
+															pF->getName() == "_ZdlPv" ||
+															pF->getName() == "_ZdaPv")) {
+
+					    //bool needSign = doReachabilityTest(value_map[pCI->getOperand(0)]);
+
+							if (force_sign || doReachabilityTest(value_map[pCI->getOperand(0)]))
+                inst_list.push_back(pCI);
+            }
+
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+  }
+
+	while (!inst_list.empty()) {
+		Instruction *pI = inst_list.front();
+		Function *pF = pI->getFunction();
+		inst_list.pop_front();
+
+		if (AllocaInst *pAI = dyn_cast<AllocaInst>(pI)) {
+			Type *ty = pAI->getAllocatedType();
+
+			if (ty->isArrayTy() || ty->isStructTy())
+				function_modified = handleAlloca(pF, pAI) || function_modified;
+			else
+				assert(false);
+
+		} else if (CallInst *pCI = dyn_cast<CallInst>(pI)) {
+			Function *called_func = pCI->getCalledFunction();
+
+			if (called_func && (called_func->getName() == "malloc" ||
+                        called_func->getName() == "_Znwm" /* new */ ||
+                        called_func->getName() == "_Znam" /* new[] */ ||
+												called_func->getName() == "calloc" ||
+												called_func->getName() == "realloc")) {
+
+				function_modified = handleMalloc(pF, pCI) || function_modified;
+			} else if (called_func && (called_func->getName() == "free" ||
+												called_func->getName() == "_ZdlPv" ||
+												called_func->getName() == "_ZdaPv")) {
+
+				function_modified = handleFree(pF, pCI) || function_modified;
+			} else {
+				pCI->dump();
+				assert(false);
+			}
+		}
+	}
+
+	return function_modified;
+}
+
+bool AOSReachTestPass::doReachabilityTest(AOSNode *node) {
+	if (force_sign)
+		return true;
+
+  list<AOSNode *> node_list;
+  set<AOSNode *> visit_set;
+
+	assert(node != nullptr);
+
+	node_list.push_back(node);
+  visit_set.insert(node);
+
+	//errs() << "Print node!\n";
+	//printNode(node);
+
+  while (!node_list.empty()) {
+    node = node_list.front();
+    node_list.pop_front();
+
+		if (node->isTainted())
+			return true;
+
+    for (auto it = node->children.begin(); it != node->children.end(); it++) {
+      if (visit_set.find(*it) == visit_set.end()) {
+        visit_set.insert(*it);
+        node_list.push_back(*it);
+				//errs() << "Print node!\n";
+				//printNode(*it);
+      }
+    }
+  }
+
+	return false;
+}
+
+bool AOSReachTestPass::handleAlloca(Function *pF, AllocaInst *pAI) {
+	Type *ty = pAI->getAllocatedType();
+  auto size = pAI->getAllocationSizeInBits(*DL);
+	Value *arg = ConstantInt::get(Type::getInt64Ty(*C), (*size) / 8);
+
+  std::vector<Type *> arg_type;
+  Type *retType = Type::getInt8PtrTy(*C);
+  arg_type.push_back(retType);
+
+	// Alloc (pacma / bndstr)
+  IRBuilder<> Builder(pAI->getNextNode());
+	FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+	auto typeIdConstant = getTypeIDConstantFrom(*ty, *C);
+  auto castA = dyn_cast<Instruction>(Builder.CreateCast(Instruction::BitCast, pAI, Type::getInt8PtrTy(*C)));
+	Constant *promote = pF->getParent()->getOrInsertFunction("_Z17wyfy_promote_basePvmm", FuncTypeA);
+	auto callA = Builder.CreateCall(promote, {castA, arg, typeIdConstant});
+  auto castB = Builder.CreateCast(Instruction::BitCast, callA, pAI->getType());
+
+	pAI->replaceAllUsesWith(castB);
+  castA->setOperand(0, pAI);
+
+  // Dealloc (bndclr)
+  auto &BBB = pF->back();
+  auto &IB = BBB.back();
+
+  IRBuilder<> BuilderE(&IB);
+	FunctionType *FuncTypeB = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C)}, false);
+	Constant *demote = pF->getParent()->getOrInsertFunction("_Z11wyfy_demotePv", FuncTypeB);
+  BuilderE.CreateCall(demote, {callA});
+
+	handleStruct(pF, pAI);
+
+	return true;
+}
+
+bool AOSReachTestPass::handleMalloc(Function *pF, CallInst *pCI) {
+  Function *called_func = pCI->getCalledFunction();
+	std::vector<Type *> arg_type;
+	arg_type.push_back(pCI->getType());
+	auto arg0 = pCI->getArgOperand(0);
+
+	if (called_func && (called_func->getName() == "malloc" ||
+							called_func->getName() == "_Znwm" /* new */ ||
+							called_func->getName() == "_Znam" /* new[] */)) {
+
+		IRBuilder<> Builder(pCI->getNextNode());
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+		auto typeIdConstant = getTypeIDConstantFrom(*(pCI->getType()), *C);
+		Constant *promote = pF->getParent()->getOrInsertFunction("_Z17wyfy_promote_basePvmm", FuncTypeA);
+		auto callA = Builder.CreateCall(promote, {pCI, arg0, typeIdConstant});
+		pCI->replaceAllUsesWith(callA);
+		callA->setOperand(0, pCI);
+	} else if (called_func && called_func->getName() == "calloc") {
+		auto arg1 = pCI->getArgOperand(1);
+
+		IRBuilder<> Builder_prev(pCI);
+		Value *res = Builder_prev.CreateMul(arg0, arg1);
+
+		IRBuilder<> Builder(pCI->getNextNode());
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+		auto typeIdConstant = getTypeIDConstantFrom(*(pCI->getType()), *C);
+		Constant *promote = pF->getParent()->getOrInsertFunction("_Z17wyfy_promote_basePvmm", FuncTypeA);
+		auto callA = Builder.CreateCall(promote, {pCI, res, typeIdConstant});
+		pCI->replaceAllUsesWith(callA);
+		callA->setOperand(0, pCI);
+	} else if (called_func && called_func->getName() == "realloc") {
+		auto arg1 = pCI->getArgOperand(1);
+
+		IRBuilder<> BuilderA(pCI);
+		FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C)}, false);
+		Constant *demote = pF->getParent()->getOrInsertFunction("_Z11wyfy_demotePv", FuncTypeA);
+		auto callA = BuilderA.CreateCall(demote, {arg0});
+		pCI->setOperand(0, callA);
+
+		IRBuilder<> BuilderB(pCI->getNextNode());
+		FunctionType *FuncTypeB = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+		auto typeIdConstant = getTypeIDConstantFrom(*(pCI->getType()), *C);
+		Constant *promote = pF->getParent()->getOrInsertFunction("_Z17wyfy_promote_basePvmm", FuncTypeB);
+		auto callB = BuilderB.CreateCall(promote, {pCI, arg1, typeIdConstant});
+		pCI->replaceAllUsesWith(callB);
+		callB->setOperand(0, pCI);
+	}
+
+	handleStruct(pF, pCI);
+
+  return true;
+}
+
+bool AOSReachTestPass::handleFree(Function *pF, CallInst *pCI) {
+  auto arg = pCI->getArgOperand(0);
+  std::vector<Type *> arg_type;
+  arg_type.push_back(arg->getType());
+
+  IRBuilder<> BuilderA(pCI);
+	FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C)}, false);
+	Constant *demote = pF->getParent()->getOrInsertFunction("_Z11wyfy_demotePv", FuncTypeA);
+	auto callA = BuilderA.CreateCall(demote, {arg});
+	arg->replaceAllUsesWith(callA);
+	callA->setOperand(0, arg);
+	//pCI->setOperand(0, callA);
+
+  return true;
+}
+
+bool AOSReachTestPass::handleStruct(Function *pF, Value *pV) {
+  list<AOSNode *> node_list;
+  set<AOSNode *> visit_set;
+	AOSNode *node = value_map[pV];
+
+	node_list.push_back(node);
+  visit_set.insert(node);
+
+  while (!node_list.empty()) {
+    node = node_list.front();
+    node_list.pop_front();
+
+		// Insert children
+		for (auto child: node->children) {
+      if (visit_set.find(child) == visit_set.end()) {
+        visit_set.insert(child);
+        node_list.push_back(child);
+      }
+    }
+
+		if (PointerType *pty = dyn_cast<PointerType>(node->ty)) {
+			Type *ety = pty->getElementType();
+
+			if (!ety->isArrayTy() && !ety->isStructTy())
+				continue;
+
+			// taint check
+			if (!force_sign && !doReachabilityTest(node))
+				continue;
+
+			for (auto const &it: node->aliases) {
+				if (auto pGEP = dyn_cast<GetElementPtrInst>(it.first)) {
+					//// TODO!!!!
+          //if (pGEP->getNumIndices() < 2)
+          //  continue;
+
+					// Skip if numIndices == 1 &&  index == 0
+					if (pGEP->getNumIndices() == 1) {
+						ConstantInt *idx = dyn_cast<ConstantInt>(*(pGEP->idx_begin()));
+
+						if (idx && idx->getSExtValue() == 0)
+							continue;
+					}
+
+          assert (pGEP->getNumIndices() < 3);
+
+					Type *src_ty = pGEP->getSourceElementType();
+
+					//if (!IsStructTy(src_ty) || pGEP->getPointerOperandType() != pV->getType() ||
+					//if (!src_ty->isStructTy() || pGEP->getPointerOperandType() != pV->getType() ||
+					//if (!src_ty->isStructTy() ||
+					if (!IsStructTy(src_ty) ||
+							sign_set.find(pGEP) != sign_set.end())
+						continue;
+
+					if (!(pGEP->getResultElementType()->isStructTy() ||
+								pGEP->getResultElementType()->isArrayTy())) {
+						pGEP->dump();
+						pGEP->getType()->dump();
+						assert(pGEP->getResultElementType()->isStructTy() || pGEP->getResultElementType()->isArrayTy());
+					}
+
+					//errs() << "pGEP->dump(): "; pGEP->dump();
+
+					// insert pacma
+					sign_set.insert(pGEP);
+
+					auto size = DL->getTypeSizeInBits(pGEP->getResultElementType());
+					Value *arg = ConstantInt::get(Type::getInt64Ty(*C), size / 8);
+					auto base = pGEP->getPointerOperand();
+
+					IRBuilder<> Builder(pGEP->getNextNode());
+					FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+					auto typeIdConstant = getTypeIDConstantFrom(*(pGEP->getType()), *C);
+					auto castA = Builder.CreateCast(Instruction::BitCast, base, Type::getInt8PtrTy(*C));
+					auto castB = dyn_cast<Instruction>(Builder.CreateCast(Instruction::BitCast, pGEP, Type::getInt8PtrTy(*C)));
+					Constant *promote = pF->getParent()->getOrInsertFunction("_Z20wyfy_promote_elementPvS_mm", FuncTypeA);
+					auto callA = Builder.CreateCall(promote, {castA, castB, arg, typeIdConstant});
+					//FunctionType *FuncTypeA = FunctionType::get(Type::getInt8PtrTy(*C), {Type::getInt8PtrTy(*C), Type::getInt64Ty(*C), Type::getInt64Ty(*C)}, false);
+					//Constant *promote = pF->getParent()->getOrInsertFunction("_Z17wyfy_promote_basePvmm", FuncTypeA);
+					//auto callA = Builder.CreateCall(promote, {castB, arg, typeIdConstant});
+					auto castC = Builder.CreateCast(Instruction::BitCast, callA, pGEP->getType());
+
+					pGEP->replaceAllUsesWith(castC);
+					castB->setOperand(0, pGEP);
+				}
+			}
+		}
+  }
+}
+
+bool AOSReachTestPass::IsArrayTy(Type *ty) {
+	if (!ty->isArrayTy())
+		return false;
+
+	while (ty->isArrayTy()) {
+		ty = ty->getArrayElementType();
+
+		if (ty->isStructTy())
+			return false;
+	}
+
+	return true;
+}
+
+bool AOSReachTestPass::IsStructTy(Type *ty) {
+	if (ty->isStructTy())
+		return true;
+	else if (!ty->isArrayTy())
+		return false;
+
+	while (ty->isArrayTy()) {
+		ty = ty->getArrayElementType();
+
+		if (ty->isStructTy())
+			return true;
+	}
+
+	return false;
+}
+
+void AOSReachTestPass::init(Module &M) {
+	for (auto &F : M) {
+		if (&F && F.getName() == "main") {
+		  C = &F.getContext();
+			DL = &F.getParent()->getDataLayout();
+
+			break;
+		}
+	}
+}
+
+// auto typeIdConstant = PARTS::getTypeIDConstantFrom(*calledValueType, F.getContext());
+// auto paced = Builder.CreateCall(autcall, { calledValue, typeIdConstant }, "");
+
+void AOSReachTestPass::buildTypeString(const Type *T, llvm::raw_string_ostream &O) {
+  if (T->isPointerTy()) {
+    O << "ptr.";
+    buildTypeString(T->getPointerElementType(), O);
+  } else if (T->isStructTy()) {
+    auto structName = dyn_cast<StructType>(T)->getStructName();
+    std::regex e("^(\\w+\\.\\w+)(\\.\\w+)?$");
+    O << std::regex_replace(structName.str(), e, "$1");
+  } else if (T->isArrayTy()) {
+    O << "arr.";
+    buildTypeString(T->getArrayElementType(), O);
+  } else if (T->isFunctionTy()) {
+    auto FuncTy = dyn_cast<FunctionType>(T);
+    O << "f.";
+    buildTypeString(FuncTy->getReturnType(), O);
+
+    for (auto p = FuncTy->param_begin(); p != FuncTy->param_end(); p++) {
+      buildTypeString(*p, O);
+    }
+  } else if (T->isVectorTy()) {
+    O << "vec." << T->getVectorNumElements();
+    buildTypeString(T->getVectorElementType(), O);
+  } else if (T->isVoidTy()) {
+    O << "v";
+  } else {
+    /* Make sure we've handled all cases we want to */
+    assert(T->isIntegerTy() || T->isFloatingPointTy());
+    T->print(O);
+  }
+}
+
+std::map<const Type *, uint64_t> TypeIDCache;
+
+uint64_t AOSReachTestPass::getTypeIDFor(const Type *T) {
+  if (!T->isPointerTy())
+    return 0; // Not a pointer, hence no type ID for this one
+
+  // TODO: This should perform caching, so calling the same Type will not
+  // reprocess the stuff. Use a Dictionary-like ADT is suggested.
+  decltype(TypeIDCache)::iterator id;
+  if ((id = TypeIDCache.find(T)) != TypeIDCache.end())
+    return id->second;
+
+  uint64_t theTypeID = 0;
+  std::string buf;
+  llvm::raw_string_ostream typeIdStr(buf);
+
+  buildTypeString(T, typeIdStr);
+  typeIdStr.flush();
+
+  // Prepare SHA3 generation
+  auto rawBuf = buf.c_str();
+  mbedtls_sha3_context sha3_context;
+  mbedtls_sha3_type_t sha3_type = MBEDTLS_SHA3_256;
+  mbedtls_sha3_init(&sha3_context);
+
+  // Prepare input and output variables
+  auto *input = reinterpret_cast<const unsigned char *>(rawBuf);
+  auto *output = new unsigned char[32]();
+
+  // Generate hash
+  auto result = mbedtls_sha3(input, buf.length(), sha3_type, output);
+  if (result != 0)
+    llvm_unreachable("SHA3 hashing failed :(");
+  memcpy(&theTypeID, output, sizeof(theTypeID));
+  delete[] output;
+
+  TypeIDCache.emplace(T, theTypeID);
+
+  return theTypeID;
+}
+
+Constant *AOSReachTestPass::getTypeIDConstantFrom(const Type &T, LLVMContext &C) {
+  //if (PartsFeCfi == PartsFeCfiFullNoType && isCodePointer(&T)) {
+  //  static auto *zero =  Constant::getIntegerValue(Type::getInt64Ty(C),
+  //                                                 APInt(64, 0));
+  //  return zero;
+  //}
+
+  //yh-if (PartsDpi == PartsDpiFullNoType && isDataPointer(&T)) {
+  //  static auto *zero = Constant::getIntegerValue(Type::getInt64Ty(C),
+  //                                                APInt(64, 0));
+  //  return zero;
+  //yh-}
+
+  return Constant::getIntegerValue(Type::getInt64Ty(C),
+                                   APInt(64, getTypeIDFor(&T) & 0xFFFF));
+                                   //APInt(64, getTypeIDFor(&T)));
+}
+
+void AOSReachTestPass::printNode(AOSNode *node) {
+  errs() << "Print node!\n";
+	errs() << "-- "; node->ty->dump();
+	for (auto it = node->aliases.begin(); it != node->aliases.end(); it ++) {
+		errs() << "-- "; it->first->dump();
+	}
+}
+
+

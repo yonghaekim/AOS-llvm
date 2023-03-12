@@ -1,0 +1,664 @@
+#include "llvm/AOS/AOSMarkTaintPass.h"
+
+char AOSMarkTaintPass::ID = 0;
+static RegisterPass<AOSMarkTaintPass> X("aos-mark", "AOS mark taint pass");
+
+Pass *llvm::AOS::createAOSMarkTaintPass() { return new AOSMarkTaintPass(); }
+
+bool AOSMarkTaintPass::runOnModule(Module &M) {
+	ex_input_set.clear();
+
+	// Handle global variables
+	handleGlobalVariables(M);
+
+	//// Handle command line arguments
+	//handleCmdLineArguments(M);
+
+	//// Handle AllocaInst and CallInst (malloc)
+	//handleInstructions(M);
+
+	//for (auto it = ex_input_set.begin(); it != ex_input_set.end(); it++)
+	//	(*it)->dump();
+
+  return false;
+}
+
+void AOSMarkTaintPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+}
+
+std::set<Value*> AOSMarkTaintPass::getTaintedValues() {
+	return taint_set;
+}
+
+std::set<Value*> AOSMarkTaintPass::getSignedValues() {
+	return sign_set;
+}
+
+
+void AOSMarkTaintPass::handleGlobalVariables(Module &M) {
+	for (auto &G : M.getGlobalList()) {
+		bool needTaint = false;
+		std::set<Value *> alias_set;
+
+		GlobalVariable *pGA = dyn_cast<GlobalVariable>(&G);
+
+		for (auto U: pGA->users()) {
+			errs() << "Dump users:\n";
+			U->dump();
+
+			if (Instruction *UI = dyn_cast<Instruction>(U))
+				errs() << "I am an instruction!\n";
+			else if (GEPOperator *GEPOp = dyn_cast<GEPOperator>(U))
+				errs() << "I am a GEP Op!\n";
+
+			errs() << "Dump users of a user\n";
+			for (auto U2: U->users()) {
+				U2->dump();
+			}
+		}
+
+		continue;
+
+		//errs() << "Found GlobalVariable!\n";
+		//pGA->dump();
+
+		alias_set.insert(dyn_cast<Value>(pGA));
+		// Global variables can be used as being not inst.
+		for (auto U: pGA->users()) {
+			alias_set.insert(U);
+		}
+
+		alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pGA));
+
+		//errs() << "Print alias\n";
+		//for (auto it = alias_set.begin(); it != alias_set.end(); it++) {
+		//	(*it)->dump();
+		//}
+
+		needTaint = findExInputFunc(alias_set);
+
+		if (needTaint) {
+			// TODO mark needsign
+			if (pGA->getType()->getElementType()->isArrayTy() ||
+						pGA->getType()->getElementType()->isStructTy()) {
+				//errs() << "insert to sign_set: ";
+				//pGA->dump();
+				sign_set.insert(dyn_cast<Value>(pGA));
+			}
+
+			doTaintPropagation(alias_set);
+		}
+
+		visit_set.clear();
+	}
+}
+
+void AOSMarkTaintPass::handleCmdLineArguments(Module &M) {
+	for (auto &F : M) {
+		if (F.getName() == "main") {
+			//errs() << "Found main function\n";
+
+			//TODO sign **argv
+
+			unsigned arg_nth = 0;
+
+			for (auto arg = F.arg_begin(); arg != F.arg_end(); arg++) {
+				if (arg_nth == 0) {
+					std::set<Value *> user_set;
+					user_set = getDepUsers(user_set, dyn_cast<Value>(arg));
+
+					//errs() << "Mark taint!\n";
+					for (auto it = user_set.begin(); it != user_set.end(); it++) {
+						//(*it)->dump();
+						taint_set.insert(dyn_cast<Value>(*it));
+						//(*it)->setTainted(true);
+					}
+
+					visit_set.clear();
+				} else if (arg_nth == 1) {
+					std::set<Value *> argv_set;
+
+					argv_set = getPointerAliases(argv_set, dyn_cast<Value>(arg));
+
+				//errs() << "Print argv aliases\n";
+				//for (auto it = argv_set.begin(); it != argv_set.end(); it++) {
+				//	(*it)->dump();
+				//}
+					for (auto it = argv_set.begin(); it != argv_set.end(); it++) {
+						for (auto U : (*it)->users()) {
+							//errs() << "(*it)->users(): ";
+							//U->dump();
+
+							if (Instruction *pUI = dyn_cast<Instruction>(U)) {
+								if (pUI->getOpcode() == Instruction::Load) {
+									std::set<Value *> alias_set;
+									auto pLI = dyn_cast<LoadInst>(pUI);
+								
+									alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pLI));
+
+									assert(pLI->getPointerOperand() == dyn_cast<Value>((*it)));
+
+									doTaintPropagation(alias_set);
+									visit_set.clear();
+								}
+							}
+						}
+					}
+				}
+
+				arg_nth++;
+			}
+
+			break;
+		}
+	}
+}
+
+void AOSMarkTaintPass::handleInstructions(Module &M) {
+	for (auto &F : M) {
+		for (auto &BB : F) {
+			for (auto &I : BB) {
+				bool needTaint = false;
+				std::set<Value *> alias_set;
+
+				if (AllocaInst *pAI = dyn_cast<AllocaInst>(&I)) {
+					//errs() << "Found AllocaInst!\n";
+					//pAI->dump();
+
+					alias_set.insert(dyn_cast<Value>(pAI));
+					alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pAI));
+					needTaint = findExInputFunc(alias_set);
+
+					if (needTaint) {
+						if (pAI->getAllocatedType()->isArrayTy() ||
+									pAI->getAllocatedType()->isStructTy()) {
+							//errs() << "insert to sign_set: ";
+							//pAI->dump();
+							sign_set.insert(dyn_cast<Value>(pAI));
+						}
+
+						//for (auto it = alias_set.begin(); it != alias_set.end(); it++) {
+						//	(*it)->dump();
+						//}
+
+						doTaintPropagation(alias_set);
+					}
+				} else if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+					Function *pF = pCI->getCalledFunction();
+
+					//int status;
+					//errs() << "Found function: demangled name:\n";
+					//errs() << demangle(pF->getName());
+
+					if (pF && (pF->getName() == "malloc" ||
+											pF->getName() == "calloc" ||
+											pF->getName() == "realloc")) {
+						//errs() << "Found " << pF->getName() << "\n";
+						//pCI->dump();
+
+						alias_set.insert(dyn_cast<Value>(pCI));
+						alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pCI));
+
+						//errs() << "Print alias\n";
+						//for (auto it = alias_set.begin(); it != alias_set.end(); it++) {
+						//	(*it)->dump();
+						//}
+
+						needTaint = findExInputFunc(alias_set);
+
+						if (needTaint) {
+							//errs() << "insert to sign_set: ";
+							//pCI->dump();
+							sign_set.insert(dyn_cast<Value>(pCI));
+
+							//for (auto it = alias_set.begin(); it != alias_set.end(); it++) {
+							//	(*it)->dump();
+							//}
+
+							doTaintPropagation(alias_set);
+						}
+					} else if (pF && (pF->getName() == "fopen" ||
+														pF->getName() == "freopen" ||
+														pF->getName() == "fgetc" ||
+														pF->getName() == "fgetc_unlocked" ||
+														pF->getName() == "getc" ||
+														pF->getName() == "getc_unlocked" ||
+														pF->getName() == "_IO_getc" ||
+														pF->getName() == "getchar" ||
+														pF->getName() == "getchar_unlocked" ||
+														pF->getName() == "fgetwc" ||
+														pF->getName() == "fgetwc_unlocked" ||
+														pF->getName() == "getwc" ||
+														pF->getName() == "getwc_unlocked" ||
+														pF->getName() == "getwchar" ||
+														pF->getName() == "getwchar_unlocked")) {
+
+						//errs() << "Found " << pF->getName() << "\n";
+						//pCI->dump();
+
+						std::set<Value *> user_set;
+						user_set = getDepUsers(user_set, dyn_cast<Value>(pCI));
+
+						for (auto it = user_set.begin(); it != user_set.end(); it++) {
+							//(*it)->dump();
+							taint_set.insert(dyn_cast<Value>(*it));
+							//(*it)->setTainted(true);
+						}
+					}
+				}
+
+				visit_set.clear();
+			}
+		}
+	}
+}
+
+std::set<Value*> AOSMarkTaintPass::getPointerAliases(std::set<Value*> alias_set, Value *pV) {
+	// Check if already visited
+	if (std::find(visit_set.begin(), visit_set.end(), pV)
+								!= visit_set.end())
+		return alias_set;
+
+	visit_set.insert(pV);
+
+	for (auto U: pV->users()) {
+		//errs() << "pV->users():\n";
+		//U->dump();
+
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			switch (pUI->getOpcode()) {
+				case Instruction::Call:
+			  {
+					//errs() << "Handle Call Inst!\n";
+					//pUI->dump();
+
+					CallInst *pCI = dyn_cast<CallInst>(pUI);
+					Function *pF = pCI->getCalledFunction();
+
+					//TODO can intrinsic func return pointer alias?
+					if (pF && !pF->isVarArg() && !pF->isDeclaration()) {
+						unsigned arg_nth = 0;
+
+						for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+							if (dyn_cast<Value>(arg) == pV)
+								break;
+
+							arg_nth++;
+						}
+
+						assert(arg_nth < pCI->arg_size());
+						assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+						unsigned t = 0;
+						for (auto arg = pF->arg_begin(); arg != pF->arg_end(); arg++) {
+							if (t++ == arg_nth) {
+								//arg->dump();
+
+						//errs() << "arg_nth: " << arg_nth << "\n";
+						//errs() << "t: " << t << "\n";
+
+								std::set<Value *> arg_alias_set;
+								arg_alias_set = getPointerAliases(arg_alias_set, arg);
+
+								for (auto it = arg_alias_set.begin(); it != arg_alias_set.end(); it++)
+									alias_set.insert(*it);
+
+								//return value...? can iterate over user list from func?
+								for (auto &BB : *pF) {
+									for (auto &I : BB) {
+										if (ReturnInst *pRI = dyn_cast<ReturnInst>(&I)) {
+											//errs() << "Found return inst!\n";
+											if(std::find(arg_alias_set.begin(), arg_alias_set.end(),
+													pRI->getReturnValue()) != arg_alias_set.end()) {
+												//errs() << "Continue with return\n";
+												alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pCI));
+											}
+
+											break;
+										}
+									}
+								}
+
+								arg_alias_set.clear();
+
+								break;
+							}
+						}
+					}
+
+					break;
+				}
+				case Instruction::Store:
+				{
+					//visit_set.insert(pV);
+					auto pSI = dyn_cast<StoreInst>(pUI);
+
+					if (pSI->getValueOperand() == pV) {
+						//errs() << "Handle Store Inst!\n";
+						//pSI->dump();
+
+						auto op = pSI->getPointerOperand();
+
+						//op->dump();
+						//op->getOpcode()->dump();
+						//op->getType()->dump();
+
+						for (auto U2: op->users()) {
+							if (auto pUI2 = dyn_cast<Instruction>(U2)) {
+								if (pUI2->getOpcode() == Instruction::Load) {
+									auto pLI = dyn_cast<LoadInst>(pUI2);
+
+						//errs() << "Found Load Inst!\n";
+						//pLI->dump();
+
+									//if (std::find(alias_set.begin(), alias_set.end(), dyn_cast<Value>(pLI))
+									//							== alias_set.end())
+									alias_set.insert(dyn_cast<Value>(pLI));
+
+									alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pLI));
+									
+									assert(pLI->getPointerOperand() == dyn_cast<Value>(op));
+								}
+							}
+						}
+
+						//if (GetElementPtrInst* pGEP = dyn_cast<Instruction::GetElementPtr>(op)) {
+						//	errs() << "Found GEP!\n";
+						//	op->dump();
+						//}
+
+					}
+
+					break;
+				}
+				case Instruction::Select:
+				case Instruction::PHI:
+				case Instruction::BitCast:
+				case Instruction::GetElementPtr:
+				case Instruction::PtrToInt:
+				case Instruction::IntToPtr:
+				case Instruction::Add:
+				case Instruction::Sub:
+				case Instruction::Shl:
+				//case Instruction::Lshr:
+				//case Instruction::Ashr:
+				case Instruction::And:
+				case Instruction::Or:
+				case Instruction::Xor:
+				{
+					//if (pUI->getOpcode() == Instruction::IntToPtr) {
+					//	errs() << "Users of IntToPtr\n";
+
+					//	for (auto tU : pUI->users()) {
+					//		tU->dump();
+					//	}
+					//}
+
+					//visit_set.insert(pV);
+					//errs() << "Handle Inst!\n";
+					//if (std::find(alias_set.begin(), alias_set.end(), dyn_cast<Value>(pUI))
+					//							== alias_set.end())
+					alias_set.insert(dyn_cast<Value>(pUI));
+					alias_set = getPointerAliases(alias_set, dyn_cast<Value>(pUI));
+
+					break;
+				}
+				default:
+					break;
+			}
+		}
+	}
+
+	return alias_set;
+}
+
+bool AOSMarkTaintPass::findExInputFunc(std::set<Value *> alias_set) {
+	// iterate alias_set
+	for (auto alias = alias_set.begin(); alias != alias_set.end(); alias++) {
+		for (auto U : (*alias)->users()) {
+			//errs() << "In findExInputFunc\n";
+			//U->dump();
+
+			if (CallInst *pCI = dyn_cast<CallInst>(U)) {
+				Function *pF = pCI->getCalledFunction();
+
+				//errs() << "  @@pF->name(): " << pF->getName() << "\n";
+				if (pF && (pF->getName() == "__isoc99_scanf" ||
+										pF->getName() == "scanf" ||
+										pF->getName() == "wscanf")) {
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					ex_input_set.insert(dyn_cast<Value>(U));
+
+					// Except arg 0
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+						if (t != 0) {
+							if (std::find(alias_set.begin(), alias_set.end(),
+														dyn_cast<Value>(arg)) != alias_set.end())
+								return true;
+						}
+
+						t++;
+					}		
+				} else if (pF && (pF->getName() == "fscanf" ||
+													pF->getName() == "__isoc99_fscanf" ||
+													pF->getName() == "wscanf")) {
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					ex_input_set.insert(dyn_cast<Value>(U));
+
+					// Except arg 0 & 1
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+						if (t != 0 && t != 1) {
+							if (std::find(alias_set.begin(), alias_set.end(),
+														dyn_cast<Value>(arg)) != alias_set.end())
+								return true;
+						}
+
+						t++;
+					}
+				} else if (pF && (pF->getName() == "fread" ||
+													pF->getName() == "fread_unlocked" ||
+													pF->getName() == "fgets" ||
+													pF->getName() == "fgets_unlocked" ||
+													pF->getName() == "gets" ||
+													pF->getName() == "gets_unlocked" ||
+													pF->getName() == "read" ||
+													pF->getName() == "_ZNSi7getlineEPclc" ||
+													pF->getName() == "getline")) {
+
+					//errs() << "Found " << pF->getName() << ": ";
+					//U->dump();
+					ex_input_set.insert(dyn_cast<Value>(U));
+
+					// Arg 0
+					int t = 0;
+					for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+						if (t == 0) {
+							if (std::find(alias_set.begin(), alias_set.end(),
+														dyn_cast<Value>(arg)) != alias_set.end())
+								return true;
+							break;
+						}
+					}
+				}
+				// TODO more IO functions...
+			}
+		}
+	}
+
+	return false;
+}
+
+void AOSMarkTaintPass::doTaintPropagation(std::set<Value *> alias_set) {
+	//errs() << "--Start taint propagation\n";
+
+	std::set<Value *> user_set;
+	visit_set.clear();
+
+	for (auto it = alias_set.begin(); it != alias_set.end(); it++) {
+		//errs() << "----I am an alias ";
+		//(*it)->dump();
+		taint_set.insert(dyn_cast<Value>(*it));
+
+		// Handle string functions?
+		// + sscanf
+		//
+		if (std::find(user_set.begin(), user_set.end(), dyn_cast<Value>(*it))
+									== user_set.end()) {
+
+			user_set.insert(dyn_cast<Value>(*it));
+
+			for (auto U : (*it)->users()) {
+				//errs() << "------I am a user ";
+				//U->dump();
+
+				if (auto pUI = dyn_cast<Instruction>(U)) {
+					if (pUI->getOpcode() == Instruction::Load) {
+
+						//visit_set.clear();
+						user_set = getDepUsers(user_set, dyn_cast<Value>(pUI));
+					}
+				}
+			}
+		}
+	}
+
+	for (auto itb = user_set.begin(); itb != user_set.end(); itb++) {
+		//(*itb)->dump();
+		taint_set.insert(dyn_cast<Value>(*itb));
+		//(*itb)->setTainted(true);
+	}
+
+	user_set.clear();
+	visit_set.clear();
+}
+
+std::set<Value*> AOSMarkTaintPass::getDepUsers(std::set<Value *> user_set, Value *pV) {
+	// Check if already handled
+	if (std::find(visit_set.begin(), visit_set.end(), pV)
+								!= visit_set.end())
+		return user_set;
+
+	visit_set.insert(pV);
+
+	for (auto U: pV->users()) {
+		//errs() << "--------I am a user of a user ";
+		//U->dump();
+
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			switch (pUI->getOpcode()) {
+				case Instruction::Call:
+				{
+					//errs() << "Handle Call Inst!\n";
+
+					CallInst *pCI = dyn_cast<CallInst>(pUI);
+					Function *pF = pCI->getCalledFunction();
+
+					//TODO can intrinsic func return pointer alias?
+					if (pF && !pF->isVarArg() && !pF->isDeclaration()) {
+						unsigned arg_nth = 0;
+
+						for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+							if (dyn_cast<Value>(arg) == pV)
+								break;
+
+							arg_nth++;
+						}
+
+						assert(arg_nth < pCI->arg_size());
+						assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+						//errs() << "arg_nth: " << arg_nth << "\n";
+
+						unsigned t = 0;
+						for (auto arg = pF->arg_begin(); arg != pF->arg_end(); arg++) {
+							if (t++ == arg_nth) {
+								//arg->dump();
+
+								std::set<Value *> arg_user_set;
+								arg_user_set = getDepUsers(arg_user_set, arg);
+
+								for (auto it = arg_user_set.begin(); it != arg_user_set.end(); it++)
+									user_set.insert(*it);
+
+								//return value...? can iterate over user list from func?
+								for (auto &BB : *pF) {
+									for (auto &I : BB) {
+										if (ReturnInst *pRI = dyn_cast<ReturnInst>(&I)) {
+											//errs() << "Found return inst!\n";
+											if(std::find(arg_user_set.begin(), arg_user_set.end(),
+													pRI->getReturnValue()) != arg_user_set.end()) {
+												//errs() << "Continue with return\n";
+												user_set = getDepUsers(user_set, dyn_cast<Value>(pCI));
+											}
+
+											break;
+										}
+									}
+								}
+
+								arg_user_set.clear();
+
+								break;
+							}
+						}
+					} else {
+						//TODO need to insert intrinsic function????
+						//visit_set.insert(pV);
+						user_set.insert(dyn_cast<Value>(pUI));
+						user_set = getDepUsers(user_set, dyn_cast<Value>(pUI));
+					}
+
+					break;
+				}
+				case Instruction::Store:
+				{
+					//visit_set.insert(pV);
+
+					auto pSI = dyn_cast<StoreInst>(pUI);
+
+					if (pSI->getValueOperand() == pV) {
+						//errs() << "Handle Store Inst!\n";
+
+						auto op = pSI->getPointerOperand();
+
+						for (auto U2: op->users()) {
+							if (auto pUI2 = dyn_cast<Instruction>(U2)) {
+								if (pUI2->getOpcode() == Instruction::Load) {
+									auto pLI = dyn_cast<LoadInst>(pUI2);
+
+									if (std::find(user_set.begin(), user_set.end(), dyn_cast<Value>(pLI))
+																== user_set.end())
+										user_set.insert(dyn_cast<Value>(pLI));
+
+									user_set = getDepUsers(user_set, dyn_cast<Value>(pLI));
+									
+									assert(pLI->getPointerOperand() == dyn_cast<Value>(op));
+								}
+							}
+						}
+					}
+
+					break;
+				}
+				case Instruction::Load:
+					//visit_set.insert(pV);
+					break;
+				default:
+				{
+					//visit_set.insert(pV);
+					user_set.insert(dyn_cast<Value>(pUI));
+					user_set = getDepUsers(user_set, dyn_cast<Value>(pUI));
+					break;
+				}
+			}
+		}
+	}
+
+	return user_set;
+}
+

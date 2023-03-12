@@ -1,0 +1,473 @@
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/AOS/AOS.h"
+#include <iostream>
+
+using namespace llvm;
+using namespace AOS;
+
+#define DEBUG_TYPE "aos_mark_taint_pass"
+
+namespace {
+  class AOSMarkTaintPass : public FunctionPass {
+
+  public:
+    static char ID; // Pass identification, replacement for typeid
+    AOSMarkTaintPass() : FunctionPass(ID) {}
+
+		std::list<Value*> value_list;
+
+    bool runOnFunction(Function &F) override;
+
+  private:  
+    //bool handleValue(Instruction *pI);
+    bool handleValue(Value *pV);
+    bool handleCallInstruction(CallInst *pCI, Value *pV);
+    bool handleStoreInstruction(StoreInst *pSI);
+    bool handleLoadInstruction(LoadInst *pLI);
+		bool isExternalIOFunction(CallInst *pCI, Value *pV);
+    void propPointer(Value *pV);
+    void doTaintPropagation(Value *pV);
+  };
+}
+
+char AOSMarkTaintPass::ID = 0;
+static RegisterPass<AOSMarkTaintPass> X("aos-mark", "AOS mark taint pass");
+
+Pass *llvm::AOS::createAOSMarkTaintPass() { return new AOSMarkTaintPass(); }
+
+bool AOSMarkTaintPass::runOnFunction(Function &F) {
+  bool function_modified = false;
+
+  std::list<CallInst*> callInsts;
+
+	//bool found = (std::find(my_list.begin(), my_list.end(), my_var) != my_list.end());
+
+	//TODO: arguments?
+	//errs() << F.getName() << "\n";
+
+	//for (auto arg = F.arg_begin(); arg != F.arg_end(); ++arg) {
+	//	errs() << "arg:\n";
+	//	arg->dump();
+	//	//if (auto* ci = dyn_cast<ConstantInt>(arg))
+	//	//	errs() << ci->getValue() << "\n";
+	//	//errs() << *arg << "\n";
+	//}
+
+	for (auto &BB : F) {
+		for (auto &I : BB) {
+			bool needTaint = false;
+
+			if (AllocaInst *pAI = dyn_cast<AllocaInst>(&I)) {
+				errs() << "Found AllocaInst! ";
+				pAI->dump();
+
+				needTaint = handleValue(dyn_cast<Value>(pAI));
+			} else if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+				Function *pF = pCI->getCalledFunction();
+
+				if (pF && (pF->getName() == "malloc" ||
+										pF->getName() == "calloc" ||
+										pF->getName() == "realloc")) {
+					errs() << "Found " << pF->getName() << "\n";
+					pCI->dump();
+
+					needTaint = handleValue(dyn_cast<Value>(pCI));
+				}
+			}
+
+			value_list.clear();
+
+			if (needTaint) {
+				errs() << "####### needTaint!\n";
+				I.dump();
+
+				if (AllocaInst *pAI = dyn_cast<AllocaInst>(&I)) {
+					if (dyn_cast<ArrayType>(pAI->getAllocatedType())) {
+						errs() << "Found array allocation\n";
+
+						propPointer(dyn_cast<Value>(pAI));
+					} else {
+						errs() << "Found non-array allocation\n";
+
+						doTaintPropagation(dyn_cast<Value>(pAI));
+					} 
+				} else if (CallInst *pCI = dyn_cast<CallInst>(&I)) {
+  				errs() << "Found malloc allocation\n";
+
+					propPointer(dyn_cast<Value>(pAI));
+				}
+			}
+
+		}
+	}
+
+  return function_modified;
+}
+
+bool AOSMarkTaintPass::handleValue(Value *pV) {
+	bool needTaint = false;
+
+	// Check if already handled
+	if (std::find(value_list.begin(), value_list.end(),
+								pV) != value_list.end())
+		return false;
+
+	value_list.push_back(pV);
+
+	for (auto U: pV->users()) {
+		errs() << "pV->users():\n";
+		U->dump();
+
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			if (CallInst *pCI = dyn_cast<CallInst>(pUI)) {
+				errs() << "Handle Call Inst!\n";
+
+				// Look into the func
+				needTaint = handleCallInstruction(pCI, pV);
+			} else if (pUI->getOpcode() == Instruction::Store) {
+				auto pSI = dyn_cast<StoreInst>(pUI);
+
+				if (pSI->getValueOperand() == pV) {
+					errs() << "Handle Store Inst!\n";
+
+					needTaint = handleStoreInstruction(pSI);
+				}
+			} else if (pUI->getOpcode() == Instruction::Load) {
+      } else {
+				errs() << "Handle Inst!\n";
+
+				needTaint = handleValue(dyn_cast<Value>(pUI));
+			}
+		}
+
+		if (needTaint)
+			break;
+	}
+
+	return needTaint;
+}
+
+bool AOSMarkTaintPass::handleCallInstruction(CallInst *pCI, Value *pV) {
+	bool needTaint = false;
+
+	// Check if it is external IO func
+	if (isExternalIOFunction(pCI, pV)) {
+		errs() << "Found external IO func!\n";
+		return true;
+	}
+	
+	Function *pF = pCI->getCalledFunction();
+	errs() << "@@@@ " << pF->getName() << ": ";
+
+	// Handle intrinsic func
+	errs() << "isDeclaration? " << pF->isDeclaration() << "\n";
+	if (pF->isDeclaration())
+		return false; //TODO can intrinsic func return pointer alias?
+
+	// Handle function
+	unsigned arg_nth = 0;
+
+	for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+		if (dyn_cast<Value>(arg) == pV)
+			break;
+
+		arg_nth++;
+	}
+
+	assert(arg_nth < pCI->arg_size());
+	assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+	errs() << "arg_nth: " << arg_nth << "\n";
+
+	unsigned t = 0;
+	Argument *arg;
+	for (auto arg_it = pF->arg_begin(); arg_it != pF->arg_end(); arg_it++) {
+		if (t++ == arg_nth) {
+			arg = arg_it;
+			break;
+		}
+	}
+
+	arg->dump();
+
+	// Only need to iterate for pointer type
+	if (arg->hasByValAttr()) //TODO byValAttr is preferable?? 
+		return false;
+
+	handleValue(dyn_cast<Value>(arg));
+
+	if (needTaint)
+		return true;
+
+	// Handle return value of function (if needed) //TODO
+	//} else if (ReturnInst *pRI = dyn_cast<ReturnInst>(pUI)) {
+	//	errs() << "Handle Return Inst!\n";
+
+	//	needTaint = handleValue(pCI);
+
+	return needTaint;
+}
+
+bool AOSMarkTaintPass::handleStoreInstruction(StoreInst *pSI) {
+	bool needTaint = false;
+
+	// Check if already handled
+	if (std::find(value_list.begin(), value_list.end(),
+								dyn_cast<Value>(pSI)) != value_list.end())
+		return false;
+
+	value_list.push_back(dyn_cast<Value>(pSI));
+
+	Instruction *pI = dyn_cast<Instruction>(pSI->getPointerOperand());
+
+	for (auto U: pI->users()) {
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			if (pUI->getOpcode() == Instruction::Load) {
+				auto pLI = dyn_cast<LoadInst>(pUI);
+
+				if (pLI->getPointerOperand() == dyn_cast<Value>(pI))
+					needTaint = handleValue(dyn_cast<Value>(pLI));
+			}
+		}
+
+		if (needTaint)
+			break;
+	}
+
+	return needTaint;
+}
+
+bool AOSMarkTaintPass::handleLoadInstruction(LoadInst *pLI) {
+
+	return false;
+}
+
+bool AOSMarkTaintPass::isExternalIOFunction(CallInst *pCI, Value *pV) {
+	bool isExIOFunc = false;
+
+	Function *pF = pCI->getCalledFunction();
+
+	if (pF && pF->getName() == "__isoc99_scanf") {
+		errs() << "Found scanf, pV: ";
+		pV->dump();
+
+		for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+			if (dyn_cast<Value>(arg) == pV) {
+				isExIOFunc = true;
+				break;
+			}
+		}		
+	} else if (pF && (pF->getName() == "fscanf" ||
+							pF->getName() == "__isoc99_fscanf")) {
+		errs() << "Found fscanf\n";
+
+		int t = 0;
+
+		for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+			if (++t == 0)
+				continue;
+
+			if (dyn_cast<Value>(arg) == pV) {
+				isExIOFunc = true;
+				break;
+			}
+		}
+	}
+	//} else if (pF && pF->getName() == "fgets") {
+	//	errs() << "Found fgets\n";
+
+	//	Value* pV = pCI->getArgOperand(0);
+	//	basicblock_modified = markTaintInfo(dyn_cast<Instruction>(pCI), pV) || basicblock_modified;
+	//} else if (pF && (pF->getName() == "fgetc" ||
+	//						pF->getName() == "_IO_getc")) {
+
+	//	errs() << "Found fgetc\n";
+
+	//	basicblock_modified = markTaintInfo(dyn_cast<Instruction>(pCI), dyn_cast<Value>(pCI)) || basicblock_modified;
+	//} else if (pF && pF->getName() == "getc") {
+	//	errs() << "Found getc\n";
+
+	//	basicblock_modified = markTaintInfo(dyn_cast<Instruction>(pCI), dyn_cast<Value>(pCI)) || basicblock_modified;
+	//} else if (pF && pF->getName() == "getcwd") {
+	//	errs() << "Found getcwd\n";
+
+	//	Value* pV = pCI->getArgOperand(1);
+	//	basicblock_modified = markTaintInfo(dyn_cast<Instruction>(pCI), pV) || basicblock_modified;
+	//} else if (pF && pF->getName() == "read") {
+	//	errs() << "Found read\n";
+
+	//	Value* pV = pCI->getArgOperand(1);
+	//	basicblock_modified = markTaintInfo(dyn_cast<Instruction>(pCI), pV) || basicblock_modified;
+	//} 
+
+	return isExIOFunc;
+}
+
+void AOSMarkTaintPass::propPointer(Value *pV) {
+
+	// Iterate aliases and propagate taint
+
+	// Check if already handled
+	if (std::find(value_list.begin(), value_list.end(),
+								pV) != value_list.end())
+		return;
+
+	value_list.push_back(pV);
+
+	for (auto U: pV->users()) {
+		errs() << "pV->users():\n";
+		U->dump();
+
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			if (CallInst *pCI = dyn_cast<CallInst>(pUI)) {
+				errs() << "Handle Call Inst!\n";
+
+				// Look into the func
+				propCallInstruction(pCI, pV);
+			} else if (pUI->getOpcode() == Instruction::Store) {
+				auto pSI = dyn_cast<StoreInst>(pUI);
+
+				if (pSI->getValueOperand() == pV) {
+					errs() << "Handle Store Inst!\n";
+
+					propStoreInstruction(pSI);
+				}
+			} else if (pUI->getOpcode() == Instruction::Load) {
+				//
+				if (pLI->getPointerOperand() == pV) {
+					errs() << "Handle Load Inst!\n";
+					doTaintPropagation(dyn_cast<Value>(pLI));
+				}
+      } else {
+				errs() << "Handle Inst!\n";
+
+				propPointer(dyn_cast<Value>(pUI));
+			}
+		}
+	}
+
+}
+
+void AOSMarkTaintPass::propStoreInstruction(StoreInst *pSI) {
+	// Check if already handled
+	if (std::find(value_list.begin(), value_list.end(),
+								dyn_cast<Value>(pSI)) != value_list.end())
+		return;
+
+	value_list.push_back(dyn_cast<Value>(pSI));
+
+	Instruction *pI = dyn_cast<Instruction>(pSI->getPointerOperand());
+
+	for (auto U: pI->users()) {
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+			if (pUI->getOpcode() == Instruction::Load) {
+				auto pLI = dyn_cast<LoadInst>(pUI);
+
+				if (pLI->getPointerOperand() == dyn_cast<Value>(pI))
+					propValue(dyn_cast<Value>(pLI));
+			}
+		}
+	}
+}
+
+void AOSMarkTaintPass::propCallInstruction(CallInst *pCI, Value *pV) {
+	Function *pF = pCI->getCalledFunction();
+	errs() << "@@@@ " << pF->getName() << ": ";
+
+	// Handle intrinsic func
+	errs() << "isDeclaration? " << pF->isDeclaration() << "\n";
+	if (pF->isDeclaration()) {
+		pCI->setTainted(true);
+		return; //TODO can intrinsic func return pointer alias?
+	}
+
+	// Handle function
+	unsigned arg_nth = 0;
+
+	for (auto arg = pCI->arg_begin(); arg != pCI->arg_end(); ++arg) {
+		if (dyn_cast<Value>(arg) == pV)
+			break;
+
+		arg_nth++;
+	}
+
+	assert(arg_nth < pCI->arg_size());
+	assert(!pF->isVarArg()); //TODO: handle variable number of arguments
+
+	errs() << "arg_nth: " << arg_nth << "\n";
+
+	unsigned t = 0;
+	Argument *arg;
+	for (auto arg_it = pF->arg_begin(); arg_it != pF->arg_end(); arg_it++) {
+		if (t++ == arg_nth) {
+			arg = arg_it;
+			break;
+		}
+	}
+
+	arg->dump();
+
+	propPointer(dyn_cast<Value>(arg));
+
+	// Handle return value of function (if needed) //TODO
+	//} else if (ReturnInst *pRI = dyn_cast<ReturnInst>(pUI)) {
+	//	errs() << "Handle Return Inst!\n";
+
+	//	needTaint = handleValue(pCI);
+
+	return;
+}
+
+void AOSMarkTaintPass::doTaintPropagation(Value *pV) {
+
+	
+	for (auto U: pV->users()) {
+		errs() << "pV->users():\n";
+		U->dump();
+
+		if (auto pUI = dyn_cast<Instruction>(U)) {
+
+			pUI->setTainted(true);
+
+			if (CallInst *pCI = dyn_cast<CallInst>(pUI)) {
+				errs() << "Handle Call Inst!\n";
+
+				// Look into the func
+				propCallInstruction(pCI, pV);
+			} else if (pUI->getOpcode() == Instruction::Store) {
+				auto pSI = dyn_cast<StoreInst>(pUI);
+
+				if (pSI->getValueOperand() == pV) {
+					errs() << "Handle Store Inst!\n";
+
+					propStoreInstruction(pSI);
+				}
+			} else if (pUI->getOpcode() == Instruction::Load) {
+				//
+				if (pLI->getPointerOperand() == pV) {
+					errs() << "Handle Load Inst!\n";
+					doTaintPropagation(dyn_cast<Value>(pLI));
+				}
+      } else {
+				errs() << "Handle Inst!\n";
+
+				propPointer(dyn_cast<Value>(pUI));
+			}
+		}
+	}
+
+}
+
+
+

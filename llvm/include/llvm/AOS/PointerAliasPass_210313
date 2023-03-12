@@ -1,0 +1,264 @@
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/Pass.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/ADT/SCCIterator.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/AOS/AOS.h"
+#include <iostream>
+
+using namespace llvm;
+using namespace AOS;
+using namespace std;
+
+//#define DEBUG_TYPE "aos_mark_taint_pass"
+
+//namespace {
+  class AOSPointerAliasPass : public ModulePass {
+
+  public:
+    static char ID; // Pass identification, replacement for typeid
+    AOSPointerAliasPass() : ModulePass(ID) {}
+
+		class AOSAlias;
+		class AOSNode;
+
+		class AOSCGN {
+		public:
+			CallGraphNode *pCGN;
+			list<Function *> context;
+
+			AOSCGN (CallGraphNode *_pCGN) {
+				pCGN = _pCGN;
+			}
+
+			CallGraphNode *getCGN() { return pCGN; }
+			list<Function *> getContext() { return context; }
+
+			void setContext (list<Function *> _context) {
+				context = _context;
+			}
+		};
+
+    class AOSAlias {
+    public:
+      Value *ptr;
+      AOSNode *node;
+      list<Function *> context;
+
+      AOSAlias () { }
+
+      AOSAlias (Value *_ptr, AOSNode *_node) {
+        ptr = _ptr;
+				node = _node;
+      }
+
+      AOSAlias (Value *_ptr, AOSNode *_node, list<Function *> _context) {
+        ptr = _ptr;
+				node = _node;
+				context = _context;
+      }
+
+      Value *getPtr() { return ptr; }
+
+      AOSNode *getNode() { return node; }
+
+			list<Function *> getContext() { return context; }
+
+			void addContext(Function *_pF) { context.push_back(_pF); }
+
+			Function* popContext() {
+				assert(context.size() > 0);
+				Function *pF = context.back();
+				context.pop_back();
+				return pF;
+			}
+    };
+
+    class AOSNode {
+    public:
+			AOSNode *root_node;
+      list<AOSAlias *> aliases;
+      list<AOSNode *> mem_nodes;
+      Type *ty;
+      unsigned start_idx;
+      list<Value *> indice;
+      list<AOSNode *> adj_nodes;
+
+      AOSNode () { }
+ 
+      AOSNode (AOSAlias *_alias, Type *_ty, unsigned _start_idx) {
+        aliases.push_back(_alias);
+        ty = _ty;
+        start_idx = _start_idx;
+      }
+
+			void addMemUserNode(AOSNode *_node) {
+				for (auto it = mem_nodes.begin(); it != mem_nodes.end(); it++) {
+					if((*it) == _node)
+						return;
+				}
+
+				mem_nodes.push_back(_node);
+			}
+
+			bool findCurNode(Value *_ptr) {
+				for (auto it = aliases.begin(); it != aliases.end(); it++) {
+					if ((*it)->ptr == _ptr)
+						return true;
+				}
+
+				return false;
+			}
+
+			bool findMemNode(Value *_ptr) {
+				for (auto it = mem_nodes.begin(); it != mem_nodes.end(); it++) {
+					for (auto itb = (*it)->aliases.begin(); itb != (*it)->aliases.end(); itb++) {
+						if ((*itb)->ptr == _ptr)
+							return true;
+					}
+				}
+
+				return false;
+			}
+
+			AOSNode* findIndice(list<Value *> new_indice) {
+				for (auto it = adj_nodes.begin(); it != adj_nodes.end(); it++) {
+					auto itr_a = (*it)->indice.begin();
+					auto itr_b = new_indice.begin();
+					//errs() << "size: " << size << "\n";
+
+					unsigned i;
+					unsigned size = (*it)->indice.size();
+
+					if (size != new_indice.size())
+						continue;
+
+					if (size < start_idx + 1)
+						return (*it);
+
+					for (i=0; i<size; i++, itr_a++, itr_b++) {
+						if (i < start_idx)
+							continue;
+
+						if ((*itr_a) != (*itr_b))
+							break;
+					}
+
+					if (i == size)
+						return (*it);
+				}
+
+				return nullptr;
+			}
+
+			void addAlias(AOSAlias *_alias) {
+				aliases.push_back(_alias);
+			}
+
+			void addAdjNode(AOSNode *_node) {
+				adj_nodes.push_back(_node);
+			}
+    };
+
+		class AOSAliasMap {
+		public:
+	    list<AOSNode *> root_nodes;
+			list<AOSNode *> cache;
+			unsigned cache_size = 512;
+
+			void addNode(AOSNode *_root_node) {
+				root_nodes.push_back(_root_node);
+
+				if (cache.size() > cache_size)
+					cache.pop_front();
+
+				cache.push_back(_root_node);
+			}
+
+			AOSNode* getNode(Value *_ptr) {
+				for (auto it = cache.begin(); it != cache.end(); it++) {
+					AOSNode *node = (*it);
+
+					for (auto itb = node->aliases.begin(); itb != node->aliases.end(); itb++) {
+						if ((*itb)->ptr == _ptr) {
+							if (it != cache.begin()) {
+								cache.remove(*it);
+								cache.push_back(*it);
+							}
+
+							return node;
+						}
+					}
+				}
+
+				// How to reduce overhead...?
+				//errs() << "Start search!\n";
+				for (auto it = root_nodes.begin(); it != root_nodes.end(); it++) {
+					list<AOSNode *> node_list;
+					node_list.push_back(*it);
+
+					while (!node_list.empty()) {
+						AOSNode *node = node_list.front();
+						node_list.pop_front();
+
+						for (auto itb = node->aliases.begin(); itb != node->aliases.end(); itb++) {
+							//(*itb)->ptr->dump();
+							if ((*itb)->ptr == _ptr) { // TODO compare indice, with start_idx ???
+								if (cache.size() > cache_size)
+									cache.pop_front();
+
+								cache.push_back(node);
+								return node;
+							}
+						}
+
+						for (auto itb = node->adj_nodes.begin(); itb != node->adj_nodes.end(); itb++) {
+							node_list.push_back(*itb);
+						}
+					}
+				}
+
+				return nullptr;
+			}
+		};
+
+    list<AOSAlias *> work_list;
+    list<AOSCGN *> aos_cgns;
+		AOSAliasMap alias_map;
+		list<Function *> uncalled_funcs;
+
+		list<Function *> func_list;
+		map<Function *, CallGraphNode *> func_map;
+		map<Value *, AOSNode *> globalNodeMap;
+		AOSNode *root_node;
+
+    bool runOnModule(Module &M) override;
+		void getAnalysisUsage(AnalysisUsage &AU) const;
+    AOSPointerAliasPass::AOSAliasMap getAliasMap();
+
+  private:  
+		//void getFunctionsFromCallGraph(Module &M);
+		void handleGlobalVariables(Module &M);
+		void getFunctionsFromCallGraph(Module &M);
+		void handleInstructions(BasicBlock *BB);
+		//void handleCmdLineArguments(Module &M);
+		void getPointerAliases(AOSAlias *alias);
+		//PtrAlias getPointerAliases(PtrAlias ptr_alias, Value *pV, std::list<Value*> index_list);
+    Value *getArgument(Value *pI, Value *pV);
+    bool find_pointer(Value *V);
+    bool find_alias(Value *V);
+    bool index_compare(std::list<Value*> idx_list_a, std::list<Value*> idx_list_b, int start_idx);
+    int get_start_idx(Type *Ty);
+		void dump();
+  };
+//}
+

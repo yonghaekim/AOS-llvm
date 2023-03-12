@@ -1,0 +1,105 @@
+#include "llvm/AOS/AOSControlFlowPass.h"
+
+char AOSControlFlowPass::ID = 0;
+static RegisterPass<AOSControlFlowPass> X("aos-alias", "AOS pointer alias pass");
+
+Pass *llvm::AOS::createAOSControlFlowPass() { return new AOSControlFlowPass(); }
+
+bool AOSControlFlowPass::runOnModule(Module &M) {
+bool CGPass::runOnModule(Module &M) {
+    Function *main = M.getFunction("main");
+
+    G = new CallGraph(main);
+    G->valueList.push_back(main);
+    if (!main) return false;
+
+    std::deque<Function*> list;
+    list.push_back(main);
+
+    while (!list.empty()) {
+        Function* func = list.front();
+        list.pop_front();
+
+        for (Function::iterator iter = func->begin(); iter != func->end(); ++iter)
+        {
+            for (BasicBlock::iterator Biter = iter->begin(); Biter != iter->end(); ++Biter)
+            {
+                Instruction *I = &*Biter;
+
+                if (CallInst *inst = dyn_cast<CallInst>(I))
+                {
+                    //errs() <<"instruction\n";
+                    Function* called = inst->getCalledFunction();
+
+                    if (called)
+                    {
+                        //errs() <<"instruction1\n";
+                        //errs() <<"instruction2\n";
+                        G->AddEdge(func, called);
+
+                        if (!G->hasFunction(called))
+                        {
+                            list.push_back(called);
+                            G->valueList.push_back(called);
+                        }
+                        //}
+                    }
+                }
+
+                if (InvokeInst *inst = dyn_cast<InvokeInst>(I))
+                {
+                    Function* called = inst->getCalledFunction();
+                    errs() << "hello\n";
+
+                    if (called)
+                    {
+
+                        G->AddEdge(func, called);
+                        if (!G->hasFunction(called))
+                        {
+                            list.push_back(called);
+                            G->valueList.push_back(called);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    //G->print();
+    G->dump();
+
+}
+
+
+
+// Use LLVM's Strongly Connected Components (SCCs) iterator to produce
+// a reverse topological sort of SCCs.
+outs() << "SCCs for " << F.getName() << " in post-order:\n";
+for (scc_iterator<Function *> I = scc_begin(&F),
+                              IE = scc_end(&F);
+                              I != IE; ++I) {
+  // Obtain the vector of BBs in this SCC and print it out.
+  const std::vector<BasicBlock *> &SCCBBs = *I;
+  outs() << "  SCC: ";
+  for (std::vector<BasicBlock *>::const_iterator BBI = SCCBBs.begin(),
+                                                 BBIE = SCCBBs.end();
+                                                 BBI != BBIE; ++BBI) {
+    outs() << (*BBI)->getName() << "  ";
+  }
+  outs() << "\n";
+}
+
+
+
+
+  return false;
+}
+
+void AOSControlFlowPass::getAnalysisUsage(AnalysisUsage &AU) const {
+	AU.setPreservesAll();
+}
+
+std::list<AOSControlFlowPass::PtrAlias> AOSControlFlowPass::getAliasMap() {
+	return alias_map;
+}
+
